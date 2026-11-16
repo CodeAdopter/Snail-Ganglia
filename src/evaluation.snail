@@ -1,0 +1,205 @@
+# ganglia eval: top-1, top-3 and cross-entropy against the moves played in a test file, per time
+# class and 100-point rating bin of the mover, with the think time hidden (train.py's evaluate()).
+# With a file of the PyTorch net's results (--compare), it also compares each position with them.
+
+use cuda/driver
+use base/stream
+use model
+use checkpoint
+use forward
+use kernels/records
+use kernels/heads
+
+const SpeedNames = ["ultrabullet", "bullet", "blitz", "rapid", "classical", "correspondence"]
+const Bins = 31
+
+struct Tally
+    n: [6 * Bins]f64
+    top1: [6 * Bins]f64
+    top3: [6 * Bins]f64
+    ce: [6 * Bins]f64
+    positions: i64
+    # Against the Python net's results, when compared.
+    differ: i64
+    differ_hit: i64
+    differ_top3: i64
+    worst_ce: f64
+    ce_diff: f64
+
+# The PyTorch net's results per position, as read from a --compare file.
+struct PythonResults
+    count: i64
+    best: *i16
+    ce: *f32
+    top3: *u8
+
+fn read_python_results(path: str) -> PythonResults
+    let data = read_whole(path)
+    if data.len < 16 or data[0..8] as str != "GTOP0001": fail2("not a results file: ", path)
+    var r: PythonResults
+    r.count = le_i64(data.ptr + 8)
+    if data.len != 16 + r.count * 7: fail2("results file has the wrong size: ", path)
+    r.best = (data.ptr + 16) as *i16
+    r.ce = (data.ptr + 16 + r.count * 2) as *f32
+    r.top3 = data.ptr + 16 + r.count * 6
+    return r
+
+# Scores the net on every stride-th record of data, at most limit of them (0 for all), in batches
+# of p.batch with the think time hidden; compares each with python unless it is null. beat, unless
+# null, counts up after every batch, for a run that is watched for stalls.
+fn score(net: *GpuNet, p: *Pass, data: []u8, stride: i64, limit: i64, python: *PythonResults, beat: *i64 = null) -> *Tally
+    var count = (data.len / Record + stride - 1) / stride
+    if limit > 0: count = min(count, limit)
+    let batch = p.batch
+    var best = device_alloc(batch * 4)
+    var top3 = device_alloc(batch)
+    var loss = device_alloc(batch * 4)
+    let host_best = alloc[i32](batch)
+    let host_top3 = alloc[u8](batch)
+    let host_loss = alloc[f32](batch)
+    let staging = alloc[u8](batch as i64 * Record)
+    let tally = new Tally
+    tally.positions = count
+    device_zero(p.known)
+    var at: i64 = 0
+    while at < count
+        let n = min(batch as i64, count - at) as int
+        var chunk = data.ptr + at * Record
+        if stride != 1
+            for i in 0..n
+                copy(staging + i * Record, data.ptr + (at + i) * stride * Record, Record)
+            chunk = staging
+        upload(p.records, chunk, n as i64 * Record)
+        forward(net, p, n)
+        run_score_moves(n, p.records, p.out.policy, best, top3, loss)
+        download(host_best, best, n * 4)
+        download(host_top3, top3, n)
+        download(host_loss, loss, n * 4)
+        for i in 0..n
+            let r = chunk + i * Record
+            let speed = min(r[AtSpeed] as int, 5)
+            let key = speed * Bins + clamp(rec_u16(r, AtOwnRating) / 100, 0, Bins - 1)
+            let hit = host_best[i] == rec_u16(r, AtTarget)
+            tally.n[key] += 1.0
+            tally.top1[key] += hit ? 1.0 : 0.0
+            tally.top3[key] += host_top3[i] as f64
+            tally.ce[key] += host_loss[i] as f64
+            if python != null
+                let j = (at + i) * stride
+                let theirs = python.best[j] as int & 0xFFFF
+                if theirs != host_best[i]
+                    tally.differ += 1
+                    if (theirs == rec_u16(r, AtTarget)) != hit: tally.differ_hit += 1
+                if python.top3[j] != host_top3[i]: tally.differ_top3 += 1
+                let diff = abs(host_loss[i] as f64 - python.ce[j] as f64)
+                tally.worst_ce = max(tally.worst_ce, diff)
+                tally.ce_diff += diff
+        at += n
+        if beat != null: beat[0] += 1
+    free(staging)
+    free(host_best)
+    free(host_top3)
+    free(host_loss)
+    device_free(&best)
+    device_free(&top3)
+    device_free(&loss)
+    return tally
+
+# One time class's results: top-1, top-3 and cross-entropy over all its positions, and top-1
+# averaged over the 100-point rating bins from 600 to 2799 that hold at least 200 positions.
+struct SpeedResult
+    n: f64
+    top1: f64
+    top3: f64
+    ce: f64
+    macro: f64
+
+fn speed_result(t: *Tally, speed: int) -> SpeedResult
+    var r: SpeedResult
+    var bins = 0
+    for b in 0..Bins
+        let k = speed * Bins + b
+        r.n += t.n[k]
+        r.top1 += t.top1[k]
+        r.top3 += t.top3[k]
+        r.ce += t.ce[k]
+        if t.n[k] >= 200.0 and b >= 6 and b <= 27
+            r.macro += t.top1[k] / t.n[k]
+            bins += 1
+    if r.n > 0.0
+        r.top1 /= r.n
+        r.top3 /= r.n
+        r.ce /= r.n
+    r.macro /= max(bins, 1) as f64
+    return r
+
+fn report(t: *Tally)
+    for speed in 0..6
+        let r = speed_result(t, speed)
+        if r.n == 0.0: continue
+        let name = SpeedNames[speed]
+        print("{name:-12} n {r.n:9.0}  top-1 {100.0 * r.top1:.3}%  top-3 {100.0 * r.top3:.3}%  ce {r.ce:.4}  mean over bins {100.0 * r.macro:.3}%")
+
+# The summary train.py logs at each evaluation: top-1 and its mean over rating bins for bullet,
+# blitz, rapid and classical.
+fn summary(t: *Tally) -> str
+    var text: [..]u8
+    for speed in 1..5
+        let r = speed_result(t, speed)
+        if r.n == 0.0: continue
+        var buffer: [128]u8
+        let name = SpeedNames[speed]
+        let part = format(&buffer, "{name} {100.0 * r.top1:.2}% (bins {100.0 * r.macro:.2}%)")
+        if text.len > 0
+            text.push(' ')
+            text.push(' ')
+        for i in 0..part.len
+            text.push(part[i])
+    return text[0..text.len] as str
+
+# Appends t's counts to a table (tab-separated, with a header line when the file is new): a row
+# per time class from bullet to classical and 100-point rating bin of the mover that holds any
+# position, with the step, the class, the bin's lowest rating, its positions, how many of them the
+# net's first move and first three moves hit, and their summed cross-entropy. A run's evaluations
+# and eval's whole test sets share the format, for comparing nets.
+fn append_bins(path: str, step: i64, t: *Tally) -> bool
+    var (f, ok) = append_file(path)
+    if not ok: return false
+    var buffer: [256]u8
+    var good = true
+    if f.size() == 0: good = f.write("step\tclass\trating\tpositions\ttop1\ttop3\tce\n" as []u8)
+    for speed in 1..5
+        for b in 0..Bins
+            let k = speed * Bins + b
+            if t.n[k] == 0.0: continue
+            let name = SpeedNames[speed]
+            let row = format(&buffer, "{step}\t{name}\t{b * 100}\t{t.n[k]:.0}\t{t.top1[k]:.0}\t{t.top3[k]:.0}\t{t.ce[k]:.3}\n")
+            good = good and f.write(row as []u8)
+    f.close()
+    return good
+
+fn evaluate(weights: str, test: str, batch: int, limit: i64, compare_with: str, bins_path: str = "", stride: i64 = 1) -> bool
+    var ck = load_checkpoint(weights)
+    var net = gpu_net(&ck)
+    # Mapped rather than read: the system reads the file as the batches reach it.
+    var (mapped, ok) = map_file(test)
+    if not ok: fail2("cannot open ", test)
+    let data = mapped.data
+    var python: PythonResults
+    var against: *PythonResults = null
+    if compare_with.len > 0
+        python = read_python_results(compare_with)
+        if python.count < data.len / Record: fail2("the Python results cover fewer positions than ", test)
+        against = &python
+    var p = pass_buffers(net.cfg, batch, false)
+    let start = now_ms()
+    let t = score(&net, &p, data, stride, limit, against)
+    let seconds = (now_ms() - start) / 1000.0
+    print("{weights} on {test}: {t.positions} positions (every {stride}), batch {batch}")
+    print("{seconds:.1} s, {t.positions as f64 / seconds:.0} positions/s")
+    report(t)
+    if bins_path.len > 0 and not append_bins(bins_path, ck.step, t): fail2("cannot write ", bins_path)
+    if against != null
+        print("against the Python net (float32): predicted move differs on {t.differ} of {t.positions} positions, {t.differ_hit} of them changing a top-1 hit; top-3 differs on {t.differ_top3}")
+        print("cross-entropy: largest difference {t.worst_ce:.2e}, mean {t.ce_diff / t.positions as f64:.2e}")
+    return true

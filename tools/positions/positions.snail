@@ -1,0 +1,737 @@
+# Turns game files (extract's) into training positions for the net. This is the Python project's
+# positions tool (its src/positions), with --bullet added.
+#
+#     positions <games dir> train [--seed S] [--p 0.2] [--cap 2000] [--limit N] [--check 1] [--bullet 1]
+#     positions <games dir> val --out <file> [--p 0.002] [--seed S] [--limit N]
+#
+# All part files are read into memory. train streams 512-byte records to stdout without end
+# (one shuffled pass over the training games after another): blitz, rapid and classical games
+# before the cutoff, and bullet games too with --bullet 1; the rating histogram flattened by at
+# most 4x, and positions of the opening plies capped per position and rating bucket. val writes
+# one pass over the games from the cutoff on (bullet to classical, the natural distribution) to a
+# file. The record's layout is in src/kernels/records.snail.
+
+use src/fen
+use src/movegen
+use src/files
+
+extern include "io.h"
+extern "__acrt_iob_func" fn pos_iob(index: u32) -> *void
+extern "_setmode" fn pos_set_mode(fd: int, mode: int) -> int
+extern "fflush" fn pos_flush(file: *void) -> int
+extern "fseek" fn pos_seek(file: *void, offset: int, origin: int) -> int
+extern "ftell" fn pos_tell(file: *void) -> int
+
+const PosRecord = 512
+const PosMaxPlies = 16384
+const PosOpeningPlies = 24
+const PosSketchRows = 4
+const PosSketchBits = 24
+const PosBuckets = 31
+const PosClasses = 6
+const PosNoClock = 0xFFFF
+const PosNoDiff = -32768
+const PosShuffle: i64 = 1 << 20
+const PosStage = 8192
+const PosPlayers: i64 = 1 << 22
+const PosSessionGap: i64 = 1800
+const PosSessionBytes: i64 = 12
+
+struct PosData
+    bytes: *u8
+    size: i64
+    part_start: [..]i64
+    games: [..]i64            # offsets of the selected games
+    all_offsets: [..]i64      # every game in the files, in file (time) order
+    session: *u8              # per game, 6 bytes a side: see pos_sessions
+    counts: [PosClasses * PosBuckets]i64
+    weight: [PosClasses * PosBuckets]f64
+    sketch: *int
+    classes: int              # bit set of time classes kept
+    cutoff: i64
+    val: bool
+    p: f64
+    cap: f64
+    check: bool
+
+struct PosSketchJob
+    data: *PosData
+    first: i64
+    step: i64
+
+# ---- Game records ----------------------------------------------------------------------------
+
+@inline
+fn pos_u16(p: *u8) -> int
+    return p[0] as int | (p[1] as int) << 8
+
+@inline
+fn pos_i16(p: *u8) -> int
+    let v = pos_u16(p)
+    return v >= 32768 ? v - 65536 : v
+
+@inline
+fn pos_u32(p: *u8) -> u32
+    return p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16 | (p[3] as u32) << 24
+
+@inline
+fn pos_put16(p: *u8, value: int)
+    p[0] = (value & 0xFF) as u8
+    p[1] = (value >> 8 & 0xFF) as u8
+
+@inline
+fn pos_put32(p: *u8, value: u32)
+    p[0] = (value & 0xFF) as u8
+    p[1] = (value >> 8 & 0xFF) as u8
+    p[2] = (value >> 16 & 0xFF) as u8
+    p[3] = (value >> 24 & 0xFF) as u8
+
+@inline
+fn pos_put64(p: *u8, value: u64)
+    for i in 0..8
+        p[i] = (value >> (8 * i) & 0xFF) as u8
+
+fn pos_game_size(game: *u8) -> i64
+    let plies = pos_u16(game) as i64
+    let has_eval = game[3] >> 6 & 1
+    return 40 + plies * (has_eval != 0 ? 6 : 4)
+
+@inline
+fn pos_bucket(rating: int) -> int
+    return clamp(rating / 100, 0, PosBuckets - 1)
+
+# Whether a side's moves are used: a rating that moved by 40 or more in the game is provisional.
+@inline
+fn pos_side_ok(game: *u8, side: int) -> bool
+    let rating = pos_u16(game + 10 + 2 * side)
+    let diff = pos_i16(game + 14 + 2 * side)
+    return rating > 0 and (diff == PosNoDiff or abs(diff) < 40)
+
+fn pos_game_ok(data: *PosData, game: *u8) -> bool
+    let plies = pos_u16(game)
+    let speed = game[2] as int
+    let flags = game[3] as int
+    let term = flags >> 2 & 7
+    let start = pos_u32(game + 20) as i64
+    if plies < 1 or (data.classes >> speed & 1) == 0: return false
+    if flags >> 5 & 1 == 0 or term == 2: return false
+    if data.val != (start >= data.cutoff): return false
+    return true
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64
+    let y = month <= 2 ? year - 1 : year
+    let era = (y >= 0 ? y : y - 399) / 400
+    let yoe = y - era * 400
+    let doy = (153 * (month > 2 ? month - 3 : month + 9) + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+
+# The engine move for a stored move: the kind follows from the board, as the move generator
+# would have set it.
+fn pos_move(board: *Board, code: int) -> Move
+    let from = (code & 63) as Square
+    let to = (code >> 6 & 63) as Square
+    let promotion = code >> 12
+    let mover = board.squares[from].kind
+    let capture = board.squares[to] != NoPiece
+    if promotion != 0: return Move(from, to, ((capture ? 12 : 8) + promotion - 1) as MoveKind)
+    if mover == King and abs(to.file - from.file) == 2: return Move(from, to, to.file > from.file ? CastleKingside : CastleQueenside)
+    if mover == Pawn
+        if abs(to.rank - from.rank) == 2: return Move(from, to, DoublePush)
+        if to.file != from.file and not capture: return Move(from, to, EnPassant)
+    return Move(from, to, capture ? Capture : Quiet)
+
+# ---- Loading -----------------------------------------------------------------------------------
+
+fn pos_load(data: *PosData, dir: str) -> bool
+    var sizes: [..]i64
+    var path: [1024]u8
+    loop
+        let name = format(&path, "{dir}/part-{sizes.len:04d}.bin")
+        let file = fopen(name.ptr, "rb")
+        if file == null: break
+        pos_seek(file, 0, 2)
+        sizes.push(pos_tell(file) as i64)
+        fclose(file)
+    if sizes.len == 0
+        print("positions: no part files in {dir}")
+        return false
+    var total: i64 = 0
+    for s in sizes
+        total += s
+    data.bytes = alloc[u8](total)
+    data.size = total
+    var at: i64 = 0
+    let start = now_ms()
+    for i, s in sizes
+        let name = format(&path, "{dir}/part-{i:04d}.bin")
+        let file = fopen(name.ptr, "rb")
+        let got = fread(data.bytes + at, 1, s as u64, file) as i64
+        fclose(file)
+        if got != s
+            print("positions: short read of {name}")
+            return false
+        data.part_start.push(at)
+        at += s
+    data.part_start.push(at)
+    write_err(format(&pos_msg, "positions: read {sizes.len} parts, {total >> 20} MB in {(now_ms() - start) / 1000.0:.1} s\n"))
+
+    var offset: i64 = 0
+    var all: i64 = 0
+    while offset < total
+        let game = data.bytes + offset
+        all += 1
+        data.all_offsets.push(offset)
+        if pos_game_ok(data, game)
+            data.games.push(offset)
+            let plies = pos_u16(game)
+            let speed = game[2] as int
+            for side in 0..2
+                if pos_side_ok(game, side)
+                    let n = (plies + 1 - side) / 2
+                    data.counts[speed * PosBuckets + pos_bucket(pos_u16(game + 10 + 2 * side))] += n
+        offset += pos_game_size(game)
+    write_err(format(&pos_msg, "positions: {data.games.len} of {all} games selected\n"))
+    pos_sessions(data)
+    return true
+
+# Each player's session at the start of each game, from one pass in file order (the files are in
+# time order). A session goes on while the player's next game starts within 30 minutes plus twice
+# the base time of the last one. Per game and side (white first), 6 bytes: games earlier in this
+# session (u8), the result of the last one (u8: 0 loss, 1 draw, 2 win, 3 none), minutes since the
+# last game started (u16, NoClock if none this month), rating change over the session so far (i16).
+fn pos_sessions(data: *PosData)
+    let start_ms = now_ms()
+    let n = data.all_offsets.len as i64
+    data.session = alloc[u8](n * PosSessionBytes)
+    var last_start = alloc[i64](PosPlayers)
+    var last_base = alloc[i64](PosPlayers)
+    var count = alloc[int](PosPlayers)
+    var change = alloc[int](PosPlayers)
+    var result = alloc[u8](PosPlayers)
+    for i in 0..PosPlayers
+        last_start[i] = -1
+    var unknown: i64 = 0
+    for g in 0..n
+        let game = data.bytes + data.all_offsets[g]
+        let start = pos_u32(game + 20) as i64
+        let base = pos_u16(game + 6)
+        let res = game[3] as int & 3
+        for side in 0..2
+            let rec = data.session + g * PosSessionBytes + 6 * side
+            rec[0] = 0
+            rec[1] = 3
+            pos_put16(rec + 2, PosNoClock)
+            pos_put16(rec + 4, 0)
+            let player = pos_u32(game + 24 + 4 * side) as i64
+            if player >= PosPlayers
+                unknown += 1
+                continue
+            if base == PosNoClock: continue
+            let prev = last_start[player]
+            let gap = prev < 0 ? -1 as i64 : max(start - prev, 0 as i64)
+            let going = prev >= 0 and gap < PosSessionGap + 2 * last_base[player]
+            if going
+                rec[0] = min(count[player], 255) as u8
+                rec[1] = result[player]
+                pos_put16(rec + 4, clamp(change[player], -32767, 32767))
+            if gap >= 0: pos_put16(rec + 2, min(gap / 60, 65534 as i64) as int)
+            let diff = pos_i16(game + 14 + 2 * side)
+            count[player] = going ? count[player] + 1 : 1
+            change[player] = (going ? change[player] : 0) + (diff == PosNoDiff ? 0 : diff)
+            result[player] = (res == 3 ? 3 : res == 1 ? 1 : (res == 0) == (side == 0) ? 2 : 0) as u8
+            last_start[player] = start
+            last_base[player] = base as i64
+    write_err(format(&pos_msg, "positions: sessions for {n} games in {(now_ms() - start_ms) / 1000.0:.1} s ({unknown} sides without a player id)\n"))
+
+# The index of the game at offset among all games.
+fn pos_ordinal(data: *PosData, offset: i64) -> i64
+    var lo: i64 = 0
+    var hi: i64 = data.all_offsets.len as i64 - 1
+    while lo < hi
+        let mid = (lo + hi + 1) / 2
+        if data.all_offsets[mid] <= offset
+            lo = mid
+        else
+            hi = mid - 1
+    return lo
+
+var pos_msg: [1024]u8
+
+fn write_err(text: str)
+    let file = pos_iob(2)
+    fwrite(text.ptr, 1, text.len as u64, file)
+    pos_flush(file)
+
+# Flattens the rating histogram over the kept (class, bucket) cells by at most 4x.
+fn pos_weights(data: *PosData)
+    var most: i64 = 0
+    for c in data.counts
+        most = max(most, c)
+    for i in 0..PosClasses * PosBuckets
+        let c = data.counts[i]
+        data.weight[i] = c == 0 ? 0.0 : min(4.0, most as f64 / c as f64) / 4.0
+
+# ---- Opening counts ------------------------------------------------------------------------------
+
+@inline
+fn pos_mix(x: u64) -> u64
+    var h = x
+    h ^= h >> 33
+    h *= 0xFF51AFD7ED558CCD
+    h ^= h >> 33
+    h *= 0xC4CEB9FE1A85EC53
+    h ^= h >> 33
+    return h
+
+@inline
+fn pos_cell(key: u64, speed: int, bucket: int) -> u64
+    return key ^ pos_mix((speed * PosBuckets + bucket + 1) as u64 * 0x9E3779B97F4A7C15)
+
+@inline
+fn pos_slot(cell: u64, row: int) -> i64
+    return (pos_mix(cell + row as u64 * 0xD6E8FEB86659FD93) >> (64 - PosSketchBits)) as i64 + row * (1 << PosSketchBits)
+
+fn pos_sketch_count(data: *PosData, cell: u64) -> int
+    var least = int.max
+    for row in 0..PosSketchRows
+        least = min(least, atomic_load(&data.sketch[pos_slot(cell, row)]))
+    return least
+
+fn pos_sketch_worker(job: *PosSketchJob)
+    let data = job.data
+    let board = new Board
+    var i = job.first
+    while i < data.games.len
+        let game = data.bytes + data.games[i]
+        let plies = min(pos_u16(game), PosOpeningPlies)
+        let speed = game[2] as int
+        board.load_fen(StartFen)
+        for ply in 0..plies
+            let side = ply & 1
+            if pos_side_ok(game, side)
+                let cell = pos_cell(board.key, speed, pos_bucket(pos_u16(game + 10 + 2 * side)))
+                for row in 0..PosSketchRows
+                    atomic_add(&data.sketch[pos_slot(cell, row)], 1)
+            board.play(pos_move(board, pos_u16(game + 40 + 4 * ply)))
+        i += job.step
+
+fn pos_build_sketch(data: *PosData)
+    let start = now_ms()
+    data.sketch = alloc[int](PosSketchRows * (1 << PosSketchBits))
+    let threads = max(cpu_count() - 2, 1)
+    var handles: [..]u64
+    for t in 0..threads
+        let job = new PosSketchJob
+        job.data = data
+        job.first = t
+        job.step = threads
+        handles.push(spawn(pos_sketch_worker, job))
+    for h in handles
+        join(h)
+    write_err(format(&pos_msg, "positions: opening counts in {(now_ms() - start) / 1000.0:.1} s\n"))
+
+# ---- Records -----------------------------------------------------------------------------------
+
+struct PosGenerator
+    data: *PosData
+    board: *Board
+    moves: [MaxMoves]Move
+    snapshots: [9 * 64]u8
+    keys: [PosMaxPlies]u64
+    rng: SplitMix64
+    ordinal: i64              # the current game's index among all games
+
+@inline
+fn pos_frame(sq: int, flip: bool) -> int
+    return flip ? sq ^ 56 : sq
+
+fn pos_clock(game: *u8, ply: int) -> int
+    return pos_u16(game + 42 + 4 * ply)
+
+# Seconds the mover spent on ply's move; 0 for each side's first move, which Lichess doesn't time.
+fn pos_think(game: *u8, ply: int, increment: int) -> int
+    if ply < 2: return 0
+    let before = pos_clock(game, ply - 2)
+    let after = pos_clock(game, ply)
+    if before == PosNoClock or after == PosNoClock: return PosNoClock
+    return max(before - after + increment, 0)
+
+fn pos_record(gen: *PosGenerator, game: *u8, ply: int, part: int, index: i64, out: *u8)
+    let board = gen.board
+    let plies = pos_u16(game)
+    let stm = board.side as int
+    let flip = stm == 1
+    zero(out, PosRecord)
+
+    # Boards: now and the 8 before, in the mover's frame.
+    for k in 0..9
+        let row = out + 32 * k
+        if ply - k < 0
+            for j in 0..32
+                row[j] = 13 | 13 << 4
+            continue
+        let snap = &gen.snapshots[((ply - k) % 9) * 64]
+        for sq in 0..64
+            let piece = snap[sq] as Piece
+            var code = 0
+            if piece != NoPiece
+                code = piece.kind as int + (piece.side as int == stm ? 0 : 6)
+            let s = pos_frame(sq, flip)
+            row[s >> 1] |= (code << ((s & 1) * 4)) as u8
+
+    # Legal moves, grouped by from square.
+    let count = legal_moves(board, &gen.moves[0])
+    var slot_of: [64]int
+    for i in 0..64
+        slot_of[i] = -1
+    var slots = 0
+    var targets: [16]u64
+    for i in 0..16
+        out[288 + i] = 255
+    for i in 0..count
+        let m = gen.moves[i]
+        let from = pos_frame(m.from as int, flip)
+        let to = pos_frame(m.to as int, flip)
+        if slot_of[from] < 0
+            slot_of[from] = slots
+            out[288 + slots] = from as u8
+            slots += 1
+        targets[slot_of[from]] |= 1 as u64 << to
+    for i in 0..16
+        pos_put64(out + 304 + 8 * i, targets[i])
+
+    # Salience: squares touched by this move and the next three.
+    var touched: u64 = 0
+    for j in ply..min(ply + 4, plies)
+        let code = pos_u16(game + 40 + 4 * j)
+        touched |= 1 as u64 << pos_frame(code & 63, flip)
+        touched |= 1 as u64 << pos_frame(code >> 6 & 63, flip)
+    pos_put64(out + 432, touched)
+
+    # The played move's class.
+    var cls = 0xFFFF
+    if ply < plies
+        let code = pos_u16(game + 40 + 4 * ply)
+        let from = pos_frame(code & 63, flip)
+        let to = pos_frame(code >> 6 & 63, flip)
+        let promotion = code >> 12
+        cls = from * 64 + to
+        if promotion >= 1 and promotion <= 3: cls = 4096 + (promotion - 1) * 24 + (from & 7) * 3 + ((to & 7) - (from & 7) + 1)
+    pos_put16(out + 440, cls)
+
+    let ep = board.en_passant() as int
+    out[442] = (ep >= 64 ? 64 : pos_frame(ep, flip)) as u8
+    let rights = board.castling() as int
+    out[443] = (flip ? (rights >> 2 & 3) | (rights & 3) << 2 : rights) as u8
+    out[444] = min(board.state().clock as int, 255) as u8
+    var repeats = 0
+    var back = ply - 2
+    let oldest = ply - board.state().clock as int
+    while back >= 0 and back >= oldest
+        if gen.keys[back] == gen.keys[ply]: repeats += 1
+        back -= 2
+    out[445] = min(repeats, 255) as u8
+
+    let flags = game[3] as int
+    let result = flags & 3
+    out[446] = game[2]
+    out[447] = game[4]
+    out[448] = (result == 3 ? 3 : result == 1 ? 1 : (result == 0) == (stm == 0) ? 2 : 0) as u8
+    out[449] = (flags >> 2 & 7) as u8
+    pos_put16(out + 450, count)
+    let opp = 1 - stm
+    pos_put16(out + 452, pos_u16(game + 10 + 2 * stm))
+    pos_put16(out + 454, pos_u16(game + 10 + 2 * opp))
+    let base = pos_u16(game + 6)
+    let increment = pos_u16(game + 8)
+    let own_start = plies > stm ? pos_clock(game, stm) : base
+    let opp_start = plies > opp ? pos_clock(game, opp) : base
+    pos_put16(out + 456, ply >= 2 ? pos_clock(game, ply - 2) : own_start)
+    pos_put16(out + 458, ply >= 1 ? pos_clock(game, ply - 1) : opp_start)
+    pos_put16(out + 460, own_start)
+    pos_put16(out + 462, opp_start)
+    pos_put16(out + 464, base)
+    pos_put16(out + 466, increment)
+    pos_put16(out + 468, ply < plies ? pos_think(game, ply, increment) : PosNoClock)
+    pos_put16(out + 470, ply >= 1 ? pos_think(game, ply - 1, increment) : 0)
+    pos_put16(out + 472, ply)
+    pos_put16(out + 474, pos_i16(game + 14 + 2 * stm))
+    pos_put32(out + 476, pos_u32(game + 24 + 4 * stm))
+    pos_put32(out + 480, pos_u32(game + 24 + 4 * opp))
+    pos_put32(out + 484, pos_u32(game + 20))
+    pos_put32(out + 488, part as u32)
+    pos_put32(out + 492, index as u32)
+
+    # The mover's think times on their last two moves, and both players' sessions (pos_sessions):
+    # the mover's 6 bytes, then the opponent's game count and last result.
+    pos_put16(out + 500, ply >= 2 ? pos_think(game, ply - 2, increment) : PosNoClock)
+    pos_put16(out + 502, ply >= 4 ? pos_think(game, ply - 4, increment) : PosNoClock)
+    let session = gen.data.session + gen.ordinal * PosSessionBytes
+    copy(out + 504, session + 6 * stm, 6)
+    out[510] = session[6 * opp]
+    out[511] = session[6 * opp + 1]
+
+fn pos_part_of(data: *PosData, offset: i64) -> int
+    var lo = 0
+    var hi = data.part_start.len as int - 2
+    while lo < hi
+        let mid = (lo + hi + 1) / 2
+        if data.part_start[mid] <= offset
+            lo = mid
+        else
+            hi = mid - 1
+    return lo
+
+# Replays one game, handing each kept position to emit. Returns false if a stored move is not
+# legal (only checked with --check).
+fn pos_game(gen: *PosGenerator, offset: i64, emit: fn(*u8)) -> bool
+    let data = gen.data
+    let game = data.bytes + offset
+    let plies = min(pos_u16(game), PosMaxPlies)
+    let speed = game[2] as int
+    let board = gen.board
+    board.load_fen(StartFen)
+    gen.ordinal = pos_ordinal(data, offset)
+    var record: [PosRecord]u8 = undefined
+    for ply in 0..plies
+        if board.ply >= HistoryCapacity - 4: board.discard_history()
+        copy(&gen.snapshots[(ply % 9) * 64], &board.squares[0] as *u8, 64)
+        gen.keys[ply] = board.key
+        let side = ply & 1
+        if pos_side_ok(game, side)
+            let bucket = pos_bucket(pos_u16(game + 10 + 2 * side))
+            var p = data.p
+            if not data.val
+                p *= data.weight[speed * PosBuckets + bucket]
+                if ply < PosOpeningPlies
+                    let seen = pos_sketch_count(data, pos_cell(board.key, speed, bucket))
+                    if seen as f64 > data.cap: p *= data.cap / seen as f64
+            if (gen.rng.next() >> 11) as f64 * (1.0 / 9007199254740992.0) < p
+                let part = pos_part_of(data, offset)
+                pos_record(gen, game, ply, part, offset - data.part_start[part], &record[0])
+                emit(&record[0])
+        let move = pos_move(board, pos_u16(game + 40 + 4 * ply))
+        if data.check
+            let count = legal_moves(board, &gen.moves[0])
+            var found = false
+            for i in 0..count
+                if gen.moves[i] == move: found = true
+            if not found: return false
+        board.play(move)
+    return true
+
+# ---- Resignations -------------------------------------------------------------------------------
+
+# How a game ended, for the resignation records (byte 497).
+const PosResigned = 0
+const PosMated = 1
+const PosFlagged = 2
+const PosDrawn = 3
+const PosOtherEnd = 4
+
+# Emits a game's decision points for the resignation model: every one with probability p, and
+# always the loser's last one in a resigned game (label 1 in byte 496). A game ended by
+# resignation if it ended normally, decisively and not in checkmate; the loser resigned at their
+# last decision point: the final position if they were to move, else just after their last move.
+fn pos_resign_game(gen: *PosGenerator, offset: i64, emit: fn(*u8))
+    let data = gen.data
+    let game = data.bytes + offset
+    let plies = min(pos_u16(game), PosMaxPlies - 1)
+    let board = gen.board
+    board.load_fen(StartFen)
+    for ply in 0..plies
+        if board.ply >= HistoryCapacity - 4: board.discard_history()
+        board.play(pos_move(board, pos_u16(game + 40 + 4 * ply)))
+    let checked = board.side == White ? board.in_check[White]() : board.in_check[Black]()
+    let mated = legal_moves(board, &gen.moves[0]) == 0 and checked
+    let flags = game[3] as int
+    let result = flags & 3
+    let term = flags >> 2 & 7
+    var ending = PosOtherEnd
+    if result == 1: ending = PosDrawn
+    elif term == 1: ending = PosFlagged
+    elif mated: ending = PosMated
+    elif term == 0 and result != 3: ending = PosResigned
+    let loser = result == 0 ? 1 : result == 2 ? 0 : -1
+    var resign_ply = -1
+    if ending == PosResigned: resign_ply = (plies & 1) == loser ? plies : plies - 1
+
+    board.load_fen(StartFen)
+    let part = pos_part_of(data, offset)
+    gen.ordinal = pos_ordinal(data, offset)
+    var record: [PosRecord]u8 = undefined
+    for ply in 0..plies + 1
+        if board.ply >= HistoryCapacity - 4: board.discard_history()
+        copy(&gen.snapshots[(ply % 9) * 64], &board.squares[0] as *u8, 64)
+        gen.keys[ply] = board.key
+        let side = ply & 1
+        let resigns = ply == resign_ply
+        if pos_side_ok(game, side) and (resigns or (ply < plies and (gen.rng.next() >> 11) as f64 * (1.0 / 9007199254740992.0) < data.p))
+            pos_record(gen, game, ply, part, offset - data.part_start[part], &record[0])
+            record[496] = resigns ? 1 : 0
+            record[497] = ending as u8
+            record[498] = (loser < 0 ? 0 : side == loser ? 1 : 2) as u8
+            emit(&record[0])
+        if ply < plies: board.play(pos_move(board, pos_u16(game + 40 + 4 * ply)))
+
+# ---- Output ------------------------------------------------------------------------------------
+
+var pos_out_file: *void
+var pos_stage: *u8
+var pos_stage_count: i64
+var pos_written: i64
+var pos_limit: i64
+var pos_buffer: *u8
+var pos_buffer_count: i64
+var pos_rng: SplitMix64
+
+fn pos_flush_stage()
+    if pos_stage_count == 0: return
+    let n = fwrite(pos_stage, PosRecord as u64, pos_stage_count as u64, pos_out_file) as i64
+    if n != pos_stage_count
+        write_err("positions: output closed\n")
+        exit(0)
+    pos_flush(pos_out_file)
+    pos_stage_count = 0
+
+fn pos_put_out(record: *u8)
+    copy(pos_stage + pos_stage_count * PosRecord, record, PosRecord)
+    pos_stage_count += 1
+    pos_written += 1
+    if pos_stage_count == PosStage: pos_flush_stage()
+    if pos_limit > 0 and pos_written >= pos_limit
+        pos_flush_stage()
+        exit(0)
+
+# Training output goes through a shuffle buffer, so positions from one game spread out.
+fn pos_emit_shuffled(record: *u8)
+    if pos_buffer_count < PosShuffle
+        copy(pos_buffer + pos_buffer_count * PosRecord, record, PosRecord)
+        pos_buffer_count += 1
+        return
+    let j = (pos_rng.next() % PosShuffle as u64) as i64
+    pos_put_out(pos_buffer + j * PosRecord)
+    copy(pos_buffer + j * PosRecord, record, PosRecord)
+
+fn pos_emit_direct(record: *u8)
+    pos_put_out(record)
+
+# ---- Main ---------------------------------------------------------------------------------------
+
+fn pos_usage()
+    write_err("usage: positions <games dir> train|val|resign [--out file] [--games N] [--seed S] [--p P] [--cap C] [--limit N] [--check 1] [--cutoff YYYY-MM-DD] [--bullet 1]\n")
+    exit(1)
+
+fn main()
+    if arg_count() < 3: pos_usage()
+    let dir = arg(1)
+    let mode = arg(2)
+    if mode != "train" and mode != "val" and mode != "resign": pos_usage()
+    let resign = mode == "resign"
+    var games_limit: i64 = 0
+    let data = new PosData
+    data.val = mode == "val"
+    data.p = data.val ? 0.002 : resign ? 0.05 : 0.2
+    data.cap = 2000.0
+    data.classes = data.val or resign ? (1 << 1 | 1 << 2 | 1 << 3 | 1 << 4) : (1 << 2 | 1 << 3 | 1 << 4)
+    data.cutoff = days_from_civil(2026, 8, 25) * 86400
+    var seed: u64 = 1
+    var out_name = ""
+    var a = 3
+    while a < arg_count()
+        if a + 1 >= arg_count(): pos_usage()
+        let value = arg(a + 1)
+        if arg(a) == "--out": out_name = value
+        elif arg(a) == "--seed": seed = parse_int(value) as u64
+        elif arg(a) == "--p": data.p = parse_float(value)
+        elif arg(a) == "--cap": data.cap = parse_float(value)
+        elif arg(a) == "--limit": pos_limit = parse_int(value)
+        elif arg(a) == "--check": data.check = parse_int(value) != 0
+        elif arg(a) == "--games": games_limit = parse_int(value)
+        elif arg(a) == "--bullet"
+            if parse_int(value) != 0: data.classes |= 1 << 1
+        elif arg(a) == "--cutoff"
+            if value.len != 10: pos_usage()
+            data.cutoff = days_from_civil(parse_int(value[0..4]), parse_int(value[5..7]), parse_int(value[8..10])) * 86400
+        else: pos_usage()
+        a += 2
+
+    if not pos_load(data, dir): exit(1)
+    pos_weights(data)
+    if not data.val and not resign: pos_build_sketch(data)
+
+    pos_stage = alloc[u8](PosStage * PosRecord)
+    if data.val or resign
+        if out_name.len == 0: pos_usage()
+        var path: [1024]u8
+        let name = format(&path, "{out_name}")
+        pos_out_file = fopen(name.ptr, "wb")
+        if pos_out_file == null
+            write_err(format(&pos_msg, "positions: cannot write {out_name}\n"))
+            exit(1)
+    else
+        pos_out_file = pos_iob(1)
+        pos_set_mode(1, 0x8000)
+        pos_buffer = alloc[u8](PosShuffle * PosRecord)
+
+    let gen = new PosGenerator
+    gen.data = data
+    gen.board = new Board
+    gen.rng = SplitMix64(state: seed * 0x9E3779B97F4A7C15 + 1)
+    pos_rng = SplitMix64(state: seed * 0xBF58476D1CE4E5B9 + 7)
+
+    if data.val
+        let start = now_ms()
+        for offset in data.games
+            if not pos_game(gen, offset, pos_emit_direct)
+                write_err(format(&pos_msg, "positions: illegal stored move at offset {offset}\n"))
+                exit(1)
+        pos_flush_stage()
+        fclose(pos_out_file)
+        write_err(format(&pos_msg, "positions: {pos_written} validation positions in {(now_ms() - start) / 1000.0:.1} s\n"))
+        return
+
+    if resign
+        # One shuffled pass over the training games, the first --games of them.
+        let total = data.games.len
+        var picked = alloc[i64](total)
+        for i in 0..total
+            picked[i] = data.games[i]
+        var i = total - 1
+        while i > 0
+            let j = (gen.rng.next() % (i + 1) as u64) as i64
+            let t = picked[i]
+            picked[i] = picked[j]
+            picked[j] = t
+            i -= 1
+        let count = games_limit > 0 ? min(games_limit, total) : total
+        let start = now_ms()
+        for k in 0..count
+            pos_resign_game(gen, picked[k], pos_emit_direct)
+        pos_flush_stage()
+        fclose(pos_out_file)
+        write_err(format(&pos_msg, "positions: {pos_written} resignation records from {count} games in {(now_ms() - start) / 1000.0:.1} s\n"))
+        return
+
+    # Training: shuffled passes over the training games, without end.
+    let n = data.games.len
+    var order = alloc[i64](n)
+    var pass = 0
+    loop
+        for i in 0..n
+            order[i] = data.games[i]
+        var i = n - 1
+        while i > 0
+            let j = (gen.rng.next() % (i + 1) as u64) as i64
+            let t = order[i]
+            order[i] = order[j]
+            order[j] = t
+            i -= 1
+        let start = now_ms()
+        for k in 0..n
+            if not pos_game(gen, order[k], pos_emit_shuffled)
+                write_err(format(&pos_msg, "positions: illegal stored move at offset {order[k]}\n"))
+                exit(1)
+        pass += 1
+        write_err(format(&pos_msg, "positions: pass {pass} done, {pos_written} positions written, {(now_ms() - start) / 1000.0:.0} s\n"))

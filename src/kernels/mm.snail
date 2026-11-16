@@ -1,0 +1,392 @@
+# Matrix products on the tensor cores with both operands already bf16 in GPU memory.
+#
+# gemm_bf16 (gemm.snail) reads f32 operands and rounds them as it loads, which costs more than the
+# multiplies. Here an operand's tile is copied from GPU memory to shared memory as it is, 16 bytes
+# at a time and without waiting (shared_copy_async), a few steps ahead of the multiplies, and the
+# fragments warp_mma takes are read from it four 8 x 8 pieces at a time (warp_load_matrix). The
+# transposed form of that load reads a tile whose rows run along k, so an operand is used in
+# whichever direction it is stored and never transposed in memory:
+#
+#   a [m][k], b [n][k]   y = x w^T, a Linear's forward pass (w is [out][in])
+#   a [m][k], b [k][n]   dx = dy w, the gradient of a Linear's input
+#   a [k][m], b [k][n]   dw = dy^T x, the gradient of its weight, k the batch's rows
+#
+# A block computes a 128 x 128 tile of c with 8 warps of 64 x 32, in steps of 32 along k. Rows of
+# an operand start at multiples of 16 bytes: its row length is a multiple of 8.
+
+use cuda/driver
+use kernels/gemm
+
+const MmTile = 128
+const MmStep = 32
+const MmStages = 2
+# A row of a tile in shared memory, in bf16: 32 along k or 128 across, plus 8 so that the 8 rows
+# one matrix load reads fall in different banks.
+const MmRowK = MmStep + 8
+const MmRowM = MmTile + 8
+const MmTileHalves = MmTile * MmRowK       # the larger of the two layouts
+const MmStageHalves = 2 * MmTileHalves
+
+fn mm_shared_bytes() -> int
+    return MmStages * MmStageHalves * 2
+
+# What a product writes.
+enum MmOut: u8
+    Floats          # c: f32 = scale * sum + bias + beta * c
+    Halves          # h: bf16 = sum + bias, added to h when beta is not 0
+    Gelu            # h = gelu(sum + bias) and h2 = gelu'(sum + bias), both bf16
+    Times           # h = sum * h2, with h2 laid out as h; c [2 tiles of m][n] f32 gets h's column
+                    # sums over each half tile of rows, whose sum over all is the column's
+    Partial         # c [z][m][n] f32: the raw sums of this block's piece of k
+
+# Queues the copy of one step's tile of an operand to shared memory: rows first.. of `rows` (the
+# operand's m or n) and k from k0 of `depth`, zero outside. Each of the 256 threads copies 2 of the
+# tile's 512 pieces of 8 values.
+@inline
+fn mm_copy[transposed: bool](tile: *bf16, src: *bf16, ld: i64, first: int, rows: int, k0: int, depth: int)
+    let t = thread_index().x
+    @unroll
+    for e in 0..2
+        let piece = t + 256 * e
+        if transposed
+            let kr = piece / 16
+            let across = (piece % 16) * 8
+            let j = k0 + kr
+            let i = first + across
+            let valid = j < depth ? clamp((rows - i) * 2, 0, 16) : 0
+            shared_copy_async(tile + kr * MmRowM + across, src + (j as i64 * ld + i), valid)
+        else
+            let r = piece / 4
+            let along = (piece % 4) * 8
+            let i = first + r
+            let j = k0 + along
+            let valid = i < rows ? clamp((depth - j) * 2, 0, 16) : 0
+            shared_copy_async(tile + r * MmRowK + along, src + (i as i64 * ld + j), valid)
+
+# A lane's values of a 16 x 16 piece of a: tile rows m0.. and k from k0 of the step.
+@inline
+fn mm_load_a[transposed: bool](frag: *[8]bf16, tile: *bf16, m0: int, k0: int)
+    let r = lane_index() % 8
+    let q = lane_index() / 8
+    if transposed
+        warp_load_matrix_transposed(frag, tile + (k0 + r + 8 * (q >> 1)) * MmRowM + m0 + 8 * (q & 1))
+    else
+        warp_load_matrix(frag, tile + (m0 + r + 8 * (q & 1)) * MmRowK + k0 + 8 * (q >> 1))
+
+# A lane's values of two 16 x 8 pieces of b side by side: tile columns n0.. and n0 + 8.., k from
+# k0 of the step. The first four values are the first piece's.
+@inline
+fn mm_load_b[transposed: bool](frag: *[8]bf16, tile: *bf16, n0: int, k0: int)
+    let r = lane_index() % 8
+    let q = lane_index() / 8
+    if transposed
+        warp_load_matrix_transposed(frag, tile + (k0 + r + 8 * (q & 1)) * MmRowM + n0 + 8 * (q >> 1))
+    else
+        warp_load_matrix(frag, tile + (n0 + r + 8 * (q >> 1)) * MmRowK + k0 + 8 * (q & 1))
+
+# gelu(x) = x Phi(x) and its derivative Phi(x) + x phi(x). Phi(-|x|) is half of
+# erfc(|x| / sqrt 2), by Abramowitz and Stegun's 7.1.26 (absolute error below 1.5e-7), whose
+# exp(-x^2 / 2) is also phi's. Both results are rounded to bf16, which keeps 8 bits.
+fn gelu_pair(x: f32) -> (f32, f32)
+    let t = 1.0 / (1.0 + 0.3275911 * 0.70710678 * abs(x))
+    let e = fast_exp(-0.5 * x * x)
+    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+    let tail = 0.5 * poly * e
+    let cdf = x >= 0.0 ? 1.0 - tail : tail
+    return x * cdf, cdf + x * e * 0.39894228
+
+# Two bf16 side by side as the 32-bit word that holds them in memory.
+fn half_pair(a: f32, b: f32) -> u32
+    return (a as bf16).bits as u32 | ((b as bf16).bits as u32) << 16
+
+fn pair_low(w: u32) -> f32
+    return bf16.from_bits((w & 0xFFFF) as u16) as f32
+
+fn pair_high(w: u32) -> f32
+    return bf16.from_bits((w >> 16) as u16) as f32
+
+# One block's tile of the product. Element (i, kk) of a is at a[i * a_ld + kk], or a[kk * a_ld + i]
+# when a_t; element (kk, j) of b at b[j * b_ld + kk], or b[kk * b_ld + j] when b_t; element (i, j)
+# of the result at index i * c_ld + j of c, h and h2. With k_per not 0, block_index().z takes the
+# piece of k from z * k_per.
+@inline
+fn mm_block[a_t: bool, b_t: bool, out: MmOut](m: int, n: int, k: int, a: *bf16, a_ld: i64, b: *bf16, b_ld: i64, c: *f32, h: *bf16, h2: *bf16, c_ld: i64, bias: *f32, scale: f32, beta: f32, k_per: int)
+    let warp = thread_index().x / 32
+    let lane = lane_index()
+    let g = lane / 4
+    let t2 = lane % 4
+    let row0 = block_index().y * MmTile
+    let col0 = block_index().x * MmTile
+    let z = block_index().z
+    let k_start = k_per > 0 ? z * k_per : 0
+    let k_end = k_per > 0 ? min(k, k_start + k_per) : k
+    let wm = (warp / 4) * 64
+    let wn = (warp % 4) * 32
+    # A warp whose piece of the tile lies outside the result (the last tile of a width that is
+    # not a multiple of 128) copies its share of the operands and multiplies nothing.
+    let inside = row0 + wm < m and col0 + wn < n
+    let shared = shared_memory[bf16]()
+    let steps = (k_end - k_start + MmStep - 1) / MmStep
+    var acc: [4][4][4]f32
+
+    @unroll
+    for s in 0..MmStages - 1
+        if s < steps
+            let stage = shared + s * MmStageHalves
+            mm_copy[a_t](stage, a, a_ld, row0, m, k_start + s * MmStep, k_end)
+            mm_copy[b_t](stage + MmTileHalves, b, b_ld, col0, n, k_start + s * MmStep, k_end)
+        shared_copy_commit()
+    for s in 0..steps
+        # Step s's copies were queued MmStages - 1 groups ago.
+        if MmStages == 2: shared_copy_wait(0)
+        elif MmStages == 3: shared_copy_wait(1)
+        else: shared_copy_wait(2)
+        sync_threads()
+        let ahead = s + MmStages - 1
+        if ahead < steps
+            let stage = shared + (ahead % MmStages) * MmStageHalves
+            mm_copy[a_t](stage, a, a_ld, row0, m, k_start + ahead * MmStep, k_end)
+            mm_copy[b_t](stage + MmTileHalves, b, b_ld, col0, n, k_start + ahead * MmStep, k_end)
+        shared_copy_commit()
+        let ta = shared + (s % MmStages) * MmStageHalves
+        let tb = ta + MmTileHalves
+        if inside
+            @unroll
+            for kh in 0..2
+                var fa: [4][8]bf16
+                var fb: [2][8]bf16
+                @unroll
+                for i in 0..4
+                    mm_load_a[a_t](&fa[i], ta, wm + 16 * i, 16 * kh)
+                @unroll
+                for j in 0..2
+                    mm_load_b[b_t](&fb[j], tb, wn + 16 * j, 16 * kh)
+                @unroll
+                for i in 0..4
+                    @unroll
+                    for j in 0..4
+                        warp_mma(&acc[i][j], &fa[i], &fb[j / 2][(j % 2) * 4] as *[4]bf16)
+
+    if out == Times
+        # The block's tile of h2 comes through shared memory, where the operands' tiles were:
+        # read from GPU memory a pair at a time, each read would be a round trip of its own.
+        sync_threads()
+        let t = thread_index().x
+        @unroll
+        for e in 0..8
+            let piece = t + 256 * e
+            let r = piece / 16
+            let across = (piece % 16) * 8
+            let gi = row0 + r
+            let gj = col0 + across
+            let valid = gi < m ? clamp((n - gj) * 2, 0, 16) : 0
+            shared_copy_async(shared + r * MmTile + across, h2 + (gi as i64 * c_ld + gj), valid)
+        shared_copy_commit()
+        shared_copy_wait(0)
+        sync_threads()
+
+    # Of the warp's 64 x 32 piece, a lane holds rows g and g + 8 of each 16 and the columns
+    # 2 t2 and 2 t2 + 1 of each 8: pairs that lie side by side in memory. n is even.
+    @unroll
+    for j in 0..4
+        let gj = col0 + wn + j * 8 + t2 * 2
+        if gj < n
+            var bias0: f32 = 0.0
+            var bias1: f32 = 0.0
+            if bias != null
+                bias0 = bias[gj]
+                bias1 = bias[gj + 1]
+            var sum0: f32 = 0.0
+            var sum1: f32 = 0.0
+            @unroll
+            for i in 0..4
+                @unroll
+                for half in 0..2
+                    let gi = row0 + wm + i * 16 + g + half * 8
+                    if gi < m
+                        let v0 = acc[i][j][half * 2]
+                        let v1 = acc[i][j][half * 2 + 1]
+                        let at = gi as i64 * c_ld + gj
+                        if out == Floats
+                            var r0 = v0 * scale + bias0
+                            var r1 = v1 * scale + bias1
+                            if beta != 0.0
+                                r0 += beta * c[at]
+                                r1 += beta * c[at + 1]
+                            c[at] = r0
+                            c[at + 1] = r1
+                        elif out == Halves
+                            var r0 = v0 + bias0
+                            var r1 = v1 + bias1
+                            let word = (h + at) as *u32
+                            if beta != 0.0
+                                let old = word[0]
+                                r0 += beta * pair_low(old)
+                                r1 += beta * pair_high(old)
+                            word[0] = half_pair(r0, r1)
+                        elif out == Gelu
+                            let (y0, s0) = gelu_pair(v0 + bias0)
+                            let (y1, s1) = gelu_pair(v1 + bias1)
+                            ((h + at) as *u32)[0] = half_pair(y0, y1)
+                            ((h2 + at) as *u32)[0] = half_pair(s0, s1)
+                        elif out == Times
+                            let slope = ((shared + ((gi - row0) * MmTile + gj - col0)) as *u32)[0]
+                            let r0 = (v0 * pair_low(slope)) as bf16
+                            let r1 = (v1 * pair_high(slope)) as bf16
+                            ((h + at) as *u32)[0] = r0.bits as u32 | (r1.bits as u32) << 16
+                            sum0 += r0 as f32
+                            sum1 += r1 as f32
+                        else
+                            let to = c + ((z as i64 * m + gi) * n + gj)
+                            to[0] = v0
+                            to[1] = v1
+            if out == Times
+                # The 8 lanes with this lane's t2 hold the pair's other rows of the warp's piece.
+                sum0 += warp_shuffle_xor(sum0, 4)
+                sum0 += warp_shuffle_xor(sum0, 8)
+                sum0 += warp_shuffle_xor(sum0, 16)
+                sum1 += warp_shuffle_xor(sum1, 4)
+                sum1 += warp_shuffle_xor(sum1, 8)
+                sum1 += warp_shuffle_xor(sum1, 16)
+                if g == 0
+                    let to = c + ((2 * block_index().y + warp / 4) as i64 * n + gj)
+                    to[0] = sum0
+                    to[1] = sum1
+
+@kernel
+fn mm_forward(m: int, n: int, k: int, a: *bf16, a_ld: i64, b: *bf16, b_ld: i64, c: *f32, h: *bf16, h2: *bf16, c_ld: i64, bias: *f32, scale: f32, beta: f32, k_per: int)
+    mm_block[false, false, Halves](m, n, k, a, a_ld, b, b_ld, c, h, h2, c_ld, bias, scale, beta, k_per)
+
+@kernel
+fn mm_forward_floats(m: int, n: int, k: int, a: *bf16, a_ld: i64, b: *bf16, b_ld: i64, c: *f32, h: *bf16, h2: *bf16, c_ld: i64, bias: *f32, scale: f32, beta: f32, k_per: int)
+    mm_block[false, false, Floats](m, n, k, a, a_ld, b, b_ld, c, h, h2, c_ld, bias, scale, beta, k_per)
+
+@kernel
+fn mm_forward_gelu(m: int, n: int, k: int, a: *bf16, a_ld: i64, b: *bf16, b_ld: i64, c: *f32, h: *bf16, h2: *bf16, c_ld: i64, bias: *f32, scale: f32, beta: f32, k_per: int)
+    mm_block[false, false, Gelu](m, n, k, a, a_ld, b, b_ld, c, h, h2, c_ld, bias, scale, beta, k_per)
+
+@kernel
+fn mm_input(m: int, n: int, k: int, a: *bf16, a_ld: i64, b: *bf16, b_ld: i64, c: *f32, h: *bf16, h2: *bf16, c_ld: i64, bias: *f32, scale: f32, beta: f32, k_per: int)
+    mm_block[false, true, Halves](m, n, k, a, a_ld, b, b_ld, c, h, h2, c_ld, bias, scale, beta, k_per)
+
+@kernel
+fn mm_input_floats(m: int, n: int, k: int, a: *bf16, a_ld: i64, b: *bf16, b_ld: i64, c: *f32, h: *bf16, h2: *bf16, c_ld: i64, bias: *f32, scale: f32, beta: f32, k_per: int)
+    mm_block[false, true, Floats](m, n, k, a, a_ld, b, b_ld, c, h, h2, c_ld, bias, scale, beta, k_per)
+
+@kernel
+fn mm_input_times(m: int, n: int, k: int, a: *bf16, a_ld: i64, b: *bf16, b_ld: i64, c: *f32, h: *bf16, h2: *bf16, c_ld: i64, bias: *f32, scale: f32, beta: f32, k_per: int)
+    mm_block[false, true, Times](m, n, k, a, a_ld, b, b_ld, c, h, h2, c_ld, bias, scale, beta, k_per)
+
+@kernel
+fn mm_input_partial(m: int, n: int, k: int, a: *bf16, a_ld: i64, b: *bf16, b_ld: i64, c: *f32, h: *bf16, h2: *bf16, c_ld: i64, bias: *f32, scale: f32, beta: f32, k_per: int)
+    mm_block[false, true, Partial](m, n, k, a, a_ld, b, b_ld, c, h, h2, c_ld, bias, scale, beta, k_per)
+
+@kernel
+fn mm_weight(m: int, n: int, k: int, a: *bf16, a_ld: i64, b: *bf16, b_ld: i64, c: *f32, h: *bf16, h2: *bf16, c_ld: i64, bias: *f32, scale: f32, beta: f32, k_per: int)
+    mm_block[true, true, Floats](m, n, k, a, a_ld, b, b_ld, c, h, h2, c_ld, bias, scale, beta, k_per)
+
+@kernel
+fn mm_weight_partial(m: int, n: int, k: int, a: *bf16, a_ld: i64, b: *bf16, b_ld: i64, c: *f32, h: *bf16, h2: *bf16, c_ld: i64, bias: *f32, scale: f32, beta: f32, k_per: int)
+    mm_block[true, true, Partial](m, n, k, a, a_ld, b, b_ld, c, h, h2, c_ld, bias, scale, beta, k_per)
+
+# The kernels above need more shared memory than a launch may use unasked.
+fn mm_allow_shared()
+    let bytes = mm_shared_bytes()
+    allow_shared(&kernels, "mm_forward", bytes)
+    allow_shared(&kernels, "mm_forward_floats", bytes)
+    allow_shared(&kernels, "mm_forward_gelu", bytes)
+    allow_shared(&kernels, "mm_input", bytes)
+    allow_shared(&kernels, "mm_input_floats", bytes)
+    allow_shared(&kernels, "mm_input_times", bytes)
+    allow_shared(&kernels, "mm_input_partial", bytes)
+    allow_shared(&kernels, "mm_weight", bytes)
+    allow_shared(&kernels, "mm_weight_partial", bytes)
+
+fn mm_grid_x(n: int) -> int
+    return (n + MmTile - 1) / MmTile
+
+fn mm_grid_y(m: int) -> int
+    return (m + MmTile - 1) / MmTile
+
+# y [rows][n] bf16 = x [rows][k] w^T + bias, with x and w [n][k] bf16 and bias f32 or none().
+fn mm_linear(x: DeviceMemory, w: DeviceMemory, bias: DeviceMemory, y: DeviceMemory, rows: int, k: int, n: int)
+    launch_on(&kernels, Stream(handle: null), mm_grid_x(n), mm_grid_y(rows), 1, 256, 1, 1, mm_shared_bytes(),
+        gpu_args(mm_forward, rows, n, k, x, k, w, k, none(), y, none(), n, bias, 1.0, 0.0, 0))
+
+# The same into f32.
+fn mm_linear_floats(x: DeviceMemory, w: DeviceMemory, bias: DeviceMemory, y: DeviceMemory, rows: int, k: int, n: int)
+    launch_on(&kernels, Stream(handle: null), mm_grid_x(n), mm_grid_y(rows), 1, 256, 1, 1, mm_shared_bytes(),
+        gpu_args(mm_forward_floats, rows, n, k, x, k, w, k, y, none(), none(), n, bias, 1.0, 0.0, 0))
+
+# y = gelu(x w^T + bias) and slope = gelu' of the same, both [rows][n] bf16.
+fn mm_linear_gelu(x: DeviceMemory, w: DeviceMemory, bias: DeviceMemory, y: DeviceMemory, slope: DeviceMemory, rows: int, k: int, n: int)
+    launch_on(&kernels, Stream(handle: null), mm_grid_x(n), mm_grid_y(rows), 1, 256, 1, 1, mm_shared_bytes(),
+        gpu_args(mm_forward_gelu, rows, n, k, x, k, w, k, none(), y, slope, n, bias, 1.0, 0.0, 0))
+
+# dx [rows][k] bf16 = dy [rows][n] w, with w [n][k] bf16; added to dx when accumulate is set.
+fn mm_input_gradient(dy: DeviceMemory, w: DeviceMemory, dx: DeviceMemory, rows: int, k: int, n: int, accumulate: bool = false)
+    launch_on(&kernels, Stream(handle: null), mm_grid_x(k), mm_grid_y(rows), 1, 256, 1, 1, mm_shared_bytes(),
+        gpu_args(mm_input, rows, k, n, dy, n, w, k, none(), dx, none(), k, none(), 1.0, accumulate ? 1.0 : 0.0, 0))
+
+# The same into f32.
+fn mm_input_gradient_floats(dy: DeviceMemory, w: DeviceMemory, dx: DeviceMemory, rows: int, k: int, n: int)
+    launch_on(&kernels, Stream(handle: null), mm_grid_x(k), mm_grid_y(rows), 1, 256, 1, 1, mm_shared_bytes(),
+        gpu_args(mm_input_floats, rows, k, n, dy, n, w, k, dx, none(), none(), k, none(), 1.0, 0.0, 0))
+
+# The column sums that mm_input_gradient_times leaves per half tile of rows, kept between launches.
+var mm_tile_sums: DeviceMemory
+
+# dx [rows][k] bf16 = (dy w) * slope, slope [rows][k] bf16; adds dx's column sums to sums [k] f32.
+fn mm_input_gradient_times(dy: DeviceMemory, w: DeviceMemory, slope: DeviceMemory, dx: DeviceMemory, sums: DeviceMemory, rows: int, k: int, n: int)
+    let pieces = 2 * mm_grid_y(rows)
+    if mm_tile_sums.bytes < pieces as i64 * k * 4
+        device_free(&mm_tile_sums)
+        mm_tile_sums = device_alloc(pieces as i64 * k * 4)
+    launch_on(&kernels, Stream(handle: null), mm_grid_x(k), mm_grid_y(rows), 1, 256, 1, 1, mm_shared_bytes(),
+        gpu_args(mm_input_times, rows, k, n, dy, n, w, k, mm_tile_sums, dx, slope, k, none(), 1.0, 0.0, 0))
+    run_column_sums(pieces, k, mm_tile_sums, sums)
+
+# A weight's gradient has few tiles and a long sum over the batch's rows, so the sum is split into
+# pieces, one block per tile and piece: enough of them to fill the multiprocessors a few times
+# over (MmBlocks), each of 256 to 8192 rows, few enough that the blocks running together read
+# rows the cache still holds.
+const MmBlocks = 336
+
+fn mm_rows_per_piece(rows: int, tiles: int) -> int
+    let pieces = clamp((MmBlocks + tiles - 1) / tiles, (rows + 8191) / 8192, max(rows / 256, 1))
+    return ((rows + pieces - 1) / pieces + MmStep - 1) / MmStep * MmStep
+
+# dw [n][k] f32 += dy^T x, for dy [rows][n] and x [rows][k] bf16. split_sum adds the pieces of the
+# sum over the rows in order.
+fn mm_weight_gradient(dy: DeviceMemory, x: DeviceMemory, dw: DeviceMemory, rows: int, k: int, n: int)
+    let per = mm_rows_per_piece(rows, mm_grid_x(k) * mm_grid_y(n))
+    if rows <= per
+        launch_on(&kernels, Stream(handle: null), mm_grid_x(k), mm_grid_y(n), 1, 256, 1, 1, mm_shared_bytes(),
+            gpu_args(mm_weight, n, k, rows, dy, n, x, k, dw, none(), none(), k, none(), 1.0, 1.0, 0))
+        return
+    let pieces = (rows + per - 1) / per
+    let bytes = pieces as i64 * n * k * 4
+    if split_scratch.bytes < bytes
+        device_free(&split_scratch)
+        split_scratch = device_alloc(bytes)
+    launch_on(&kernels, Stream(handle: null), mm_grid_x(k), mm_grid_y(n), pieces, 256, 1, 1, mm_shared_bytes(),
+        gpu_args(mm_weight_partial, n, k, rows, dy, n, x, k, split_scratch, none(), none(), k, none(), 1.0, 1.0, per))
+    launch(&kernels, (n * k + 255) / 256, 256, 0, gpu_args(split_sum, n, k, pieces, split_scratch, dw, k, none(), 1.0, 1.0))
+
+# ---- between f32 and bf16 -----------------------------------------------------------------------
+
+@kernel
+fn halves_from_floats(n: i64, x: *f32, y: *bf16)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i < n: y[i] = x[i] as bf16
+
+@kernel
+fn floats_from_halves(n: i64, x: *bf16, y: *f32)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i < n: y[i] = x[i] as f32
+
+fn to_halves(n: i64, x: DeviceMemory, y: DeviceMemory)
+    launch(&kernels, ((n + 255) / 256) as int, 256, 0, gpu_args(halves_from_floats, n, x, y))
+
+fn to_floats(n: i64, x: DeviceMemory, y: DeviceMemory)
+    launch(&kernels, ((n + 255) / 256) as int, 256, 0, gpu_args(floats_from_halves, n, x, y))

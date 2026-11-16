@@ -1,0 +1,37 @@
+# Little-endian numbers in a buffer of bytes, a whole file read at once, and an error that ends the
+# program: what the net files' readers and writers share.
+
+use base/sys
+use base/stream
+
+fn le_i32(p: *u8) -> int
+    return (p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16 | (p[3] as u32) << 24) as int
+
+fn le_i64(p: *u8) -> i64
+    var v: u64 = 0
+    for i in 0..8
+        v |= (p[i] as u64) << (8 * i)
+    return v as i64
+
+fn put_i32(p: *u8, v: int)
+    for i in 0..4
+        p[i] = ((v as u32) >> (8 * i)) as u8
+
+fn put_i64(p: *u8, v: i64)
+    for i in 0..8
+        p[i] = ((v as u64) >> (8 * i)) as u8
+
+# A whole file in a buffer of its own, which is never freed; ends the program when it cannot be
+# read.
+fn read_whole(path: str) -> []u8
+    var (f, ok) = open_file(path)
+    if not ok: fail2("cannot open ", path)
+    let size = f.size()
+    let data = alloc[u8](max(size, 1))
+    if f.read(data[0..size]) != size: fail2("cannot read ", path)
+    f.close()
+    return data[0..size]
+
+fn fail2(what: str, detail: str)
+    var buffer: [1024]u8
+    panic(format(&buffer, "{what}{detail}"))

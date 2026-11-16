@@ -1,0 +1,204 @@
+# Quantized nets: a net's file (a .gnet or a .tnet) with its parameters stored in fewer bits.
+#
+# The format, all little-endian:
+#
+#   0     "GQUANT01"
+#   8     i32 bits: 16 when every parameter is an IEEE half float, or 2 to 8, the width of the
+#         integers that the Linears' weights are stored as
+#   12    i32 the bytes of the header of the net's own file (128 for a .gnet, 64 for a .tnet)
+#   16    i64 parameter count
+#   24    i32 tensor count, then 4 zero bytes
+#   32    the header of the net's own file, as it is there (a .gnet's without AdamW state)
+#         then each tensor, in the order of the net's own file:
+#           i64 values, i32 rows, i32 bits (16, or the integers' width)
+#           16 bits: the values as IEEE half floats
+#           integers: an f32 scale per row, then the values as unsigned integers of that width,
+#           packed from the low bit of each byte up, the tensor ending on a whole byte; a value
+#           is (its integer - top) times its row's scale, with top = 2^(bits - 1) - 1
+#
+# A Linear's weight [out][in] has a scale for each of its outputs, the one that leaves the row's
+# squared error smallest. Everything else (biases, norms, tables and embeddings) is a small part
+# of a net and stays a half float in every profile, and so do the weights a net's layout marks to
+# be kept exact (model.snail's exact_weight: a move net's value and time heads). unquantized() turns such a file back into the
+# net's own format with f32 parameters, and the loaders call it, so every command reads these
+# files as it reads the nets they were made from.
+
+use bytes
+
+const QuantizedMagic = "GQUANT01"
+const QuantizedHeader = 32
+const TensorHeader = 16
+
+# A tensor of a net's parameters: its values, and its rows when it is a Linear's weight (else 0).
+struct QuantTensor
+    count: i64
+    rows: i64
+
+# The IEEE half float nearest x (ties to even); infinity when x is too large for one.
+fn half_bits(x: f32) -> u16
+    let b = x.bits
+    let sign = (b >> 16) & 0x8000
+    let exp = ((b >> 23) & 0xFF) as int
+    var man = b & 0x7FFFFF
+    if exp == 255: return (sign | 0x7C00 | (man != 0 ? 0x200 : 0)) as u16
+    let e = exp - 127 + 15
+    if e >= 31: return (sign | 0x7C00) as u16
+    if e <= 0
+        # A subnormal half, or zero: the 24-bit significand shifted down to the halves' last place.
+        if e < -10: return sign as u16
+        man |= 0x800000
+        let shift = (14 - e) as u32
+        var half = man >> shift
+        let rest = man & ((1 as u32 << shift) - 1)
+        let middle = 1 as u32 << (shift - 1)
+        if rest > middle or (rest == middle and half & 1 != 0): half += 1
+        return (sign | half) as u16
+    var half = (e as u32) << 10 | man >> 13
+    let rest = man & 0x1FFF
+    # A carry out of the significand goes into the exponent, which is the next half up.
+    if rest > 0x1000 or (rest == 0x1000 and half & 1 != 0): half += 1
+    return (sign | half) as u16
+
+fn half_value(h: u16) -> f32
+    let sign = (h as u32 & 0x8000) << 16
+    let exp = (h as u32 >> 10) & 31
+    let man = h as u32 & 0x3FF
+    if exp == 0
+        let v = man as f32 * 0.000000059604644775390625     # 2^-24
+        return sign != 0 ? -v : v
+    if exp == 31: return f32.from_bits(sign | 0x7F800000 | man << 13)
+    return f32.from_bits(sign | (exp + 112) << 23 | man << 13)
+
+# The integer for value w at scale, within -top .. top.
+fn quantum(w: f32, scale: f32, top: int) -> int
+    if scale == 0.0: return 0
+    return clamp(floor(w / scale + 0.5) as int, -top, top)
+
+# The scale for a row of n values as integers within -top .. top that leaves the smallest squared
+# error: the largest magnitude over top, or less of it when clipping the row's few largest values
+# costs less than the coarser steps would.
+fn row_scale(w: *f32, n: i64, top: int) -> f32
+    var most: f32 = 0.0
+    for i in 0..n
+        most = max(most, abs(w[i]))
+    if most == 0.0: return 0.0
+    var best: f32 = most / top as f32
+    var least: f64 = 0.0
+    for c in 0..16
+        let scale = most * (1.0 - 0.04 * c as f32) / top as f32
+        var error: f64 = 0.0
+        for i in 0..n
+            let d = (w[i] - quantum(w[i], scale, top) as f32 * scale) as f64
+            error += d * d
+        if c == 0 or error < least
+            least = error
+            best = scale
+    return best
+
+# How a tensor is stored at a profile's bits: as integers of that width, or as half floats (16).
+fn stored_bits(t: QuantTensor, bits: int) -> int
+    return t.rows > 0 and bits < 16 ? bits : 16
+
+fn stored_bytes(t: QuantTensor, bits: int) -> i64
+    let b = stored_bits(t, bits)
+    if b == 16: return TensorHeader + t.count * 2
+    return TensorHeader + t.rows * 4 + (t.count * b + 7) / 8
+
+# A net's file quantized: header is the header of its own file, params its parameters, tensors
+# their division in order, and bits 16 or 2 to 8.
+fn quantized(header: []u8, params: *f32, tensors: []QuantTensor, bits: int) -> []u8
+    var floats: i64 = 0
+    var size: i64 = QuantizedHeader + header.len
+    for t in tensors
+        floats += t.count
+        size += stored_bytes(t, bits)
+    let out = alloc[u8](size)
+    zero(out, size)
+    copy(out, QuantizedMagic.ptr, 8)
+    put_i32(out + 8, bits)
+    put_i32(out + 12, header.len as int)
+    put_i64(out + 16, floats)
+    put_i32(out + 24, tensors.len as int)
+    copy(out + QuantizedHeader, header.ptr, header.len)
+    var at: i64 = QuantizedHeader + header.len
+    var w = params
+    for t in tensors
+        let b = stored_bits(t, bits)
+        put_i64(out + at, t.count)
+        put_i32(out + at + 8, t.rows as int)
+        put_i32(out + at + 12, b)
+        var p = out + at + TensorHeader
+        if b == 16
+            for i in 0..t.count
+                let h = half_bits(w[i])
+                p[2 * i] = (h & 0xFF) as u8
+                p[2 * i + 1] = (h >> 8) as u8
+        else
+            let top: int = (1 << (b - 1)) - 1
+            let cols = t.count / t.rows
+            let values = p + t.rows * 4
+            for r in 0..t.rows
+                let row = w + r * cols
+                let scale = row_scale(row, cols, top)
+                put_i32(p + r * 4, scale.bits as int)
+                for c in 0..cols
+                    let code = (quantum(row[c], scale, top) + top) as u32
+                    let bit = (r * cols + c) * b
+                    let shifted = code << (bit & 7) as u32
+                    values[bit >> 3] |= (shifted & 0xFF) as u8
+                    if (bit & 7) + b > 8: values[(bit >> 3) + 1] |= (shifted >> 8) as u8
+        at += stored_bytes(t, bits)
+        w += t.count
+    return out[0..size]
+
+fn is_quantized(data: []u8) -> bool
+    return data.len >= QuantizedHeader and data[0..8] as str == QuantizedMagic
+
+# The bits of a quantized net's profile (16, or 2 to 8), or 32 for a net's own file.
+fn profile_bits(data: []u8) -> int
+    return is_quantized(data) ? le_i32(data.ptr + 8) : 32
+
+# A net's own file from data: data itself unless it is a quantized net, and then its header and
+# its parameters as f32, in a buffer that is never freed. what names the file in errors.
+fn unquantized(data: []u8, what: str) -> []u8
+    if not is_quantized(data): return data
+    let p = data.ptr
+    let header = le_i32(p + 12) as i64
+    let floats = le_i64(p + 16)
+    let tensors = le_i32(p + 24)
+    if header < 0 or floats < 0 or QuantizedHeader + header > data.len: fail2("quantized net is cut short: ", what)
+    let size = header + floats * 4
+    let out = alloc[u8](max(size, 1))
+    copy(out, p + QuantizedHeader, header)
+    let w = (out + header) as *f32
+    var at: i64 = QuantizedHeader + header
+    var done: i64 = 0
+    for k in 0..tensors
+        if at + TensorHeader > data.len: fail2("quantized net is cut short: ", what)
+        let t = QuantTensor(count: le_i64(p + at), rows: le_i32(p + at + 8))
+        let b = le_i32(p + at + 12)
+        let bits = b == 16 ? 16 : b
+        if t.count < 0 or done + t.count > floats or (b != 16 and (b < 2 or b > 8 or t.rows <= 0 or t.count % t.rows != 0)): fail2("quantized net is damaged: ", what)
+        let bytes = b == 16 ? TensorHeader + t.count * 2 : TensorHeader + t.rows * 4 + (t.count * bits + 7) / 8
+        if at + bytes > data.len: fail2("quantized net is cut short: ", what)
+        let q = p + at + TensorHeader
+        if b == 16
+            for i in 0..t.count
+                w[done + i] = half_value((q[2 * i] as u32 | (q[2 * i + 1] as u32) << 8) as u16)
+        else
+            let top: int = (1 << (b - 1)) - 1
+            let mask = (1 as u32 << b as u32) - 1
+            let cols = t.count / t.rows
+            let values = q + t.rows * 4
+            for r in 0..t.rows
+                let scale = f32.from_bits(le_i32(q + r * 4) as u32)
+                for c in 0..cols
+                    let bit = (r * cols + c) * b
+                    var word = values[bit >> 3] as u32
+                    if (bit & 7) + b > 8: word |= (values[(bit >> 3) + 1] as u32) << 8
+                    let code = ((word >> (bit & 7) as u32) & mask) as int
+                    w[done + r * cols + c] = (code - top) as f32 * scale
+        at += bytes
+        done += t.count
+    if done != floats: fail2("quantized net is damaged: ", what)
+    return out[0..size]

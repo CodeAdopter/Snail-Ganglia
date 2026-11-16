@@ -1,0 +1,113 @@
+# The 512-byte training positions that positions.exe writes, already in the mover's frame. These
+# functions read them on the CPU and the GPU alike (net.decode in the Python project).
+#
+#   0     9 boards (this ply and the 8 before) x 64 squares, a 4-bit code per square, two to a
+#         byte (low nibble first): 0 empty, 1-6 own P..K, 7-12 the opponent's, 13 before the game
+#   288   16 from-squares of the mover's pieces (64 for none), and at 304 one u64 per from-square
+#         with the squares that piece can move to
+#   432   u64 salience: the squares the move played touches
+#   440   u16 the move played, as a class (from * 64 + to, or an underpromotion's class)
+#   442   u8 en passant square (64 for none), castling (1 own K, 2 own Q, 4 their K, 8 their Q),
+#         halfmove clock, repetitions, time class (0 ultrabullet .. 5 correspondence), game kind
+#         (0 rated, 1 arena, 2 swiss, 3 other), result (0 loss, 1 draw, 2 win, 3 unknown)
+#   452   u16 own rating, opponent's rating, own clock, opponent's clock (seconds), own and
+#         opponent's start clocks, base time, increment, think time of this move and the
+#         opponent's last (NoClock when unknown), ply
+
+const Record = 512
+
+const AtFromSquares = 288
+const AtMoves = 304
+const AtSalience = 432
+const AtTarget = 440
+const AtEp = 442
+const AtCastling = 443
+const AtHalfmove = 444
+const AtRepeats = 445
+const AtSpeed = 446
+const AtKind = 447
+const AtResult = 448
+const AtOwnRating = 452
+const AtOppRating = 454
+const AtOwnClock = 456
+const AtOppClock = 458
+const AtOwnStart = 460
+const AtOppStart = 462
+const AtBase = 464
+const AtIncrement = 466
+const AtThink = 468
+const AtOppThink = 470
+const AtPly = 472
+
+fn rec_u16(r: *u8, at: int) -> int
+    return r[at] as int | (r[at + 1] as int) << 8
+
+fn rec_u64(r: *u8, at: int) -> u64
+    var v: u64 = 0
+    for i in 0..8
+        v |= (r[at + i] as u64) << (8 * i)
+    return v
+
+# The code (0-13) of square sq on board k (0 is the position itself).
+fn rec_code(r: *u8, k: int, sq: int) -> int
+    let byte = r[k * 32 + sq / 2] as int
+    return sq & 1 == 0 ? byte & 15 : byte >> 4
+
+# The squares the mover's piece on from can move to, 0 when it has none.
+fn rec_targets(r: *u8, from: int) -> u64
+    for s in 0..16
+        if r[AtFromSquares + s] as int == from: return rec_u64(r, AtMoves + 8 * s)
+    return 0
+
+# Underpromotion class 4096 + c, c = piece * 24 + file * 3 + direction: from rank 7 to rank 8 as
+# knight, bishop or rook (piece 0-2), straight ahead (direction 1) or capturing.
+fn under_from(c: int) -> int
+    return 48 + (c / 3) % 8
+
+fn under_to(c: int) -> int
+    return clamp(56 + (c / 3) % 8 + c % 3 - 1, 0, 63)
+
+fn under_valid(c: int) -> bool
+    let to_file = (c / 3) % 8 + c % 3 - 1
+    return to_file >= 0 and to_file <= 7
+
+# Whether underpromotion c is legal in record r: a real move, by the mover's pawn, to a square
+# the pawn can move to.
+fn under_legal(r: *u8, c: int) -> bool
+    if not under_valid(c) or rec_code(r, 0, under_from(c)) != 1: return false
+    return (rec_targets(r, under_from(c)) >> under_to(c)) & 1 != 0
+
+# Whether class cls is a legal move in record r (net.decode's legal mask).
+fn rec_legal(r: *u8, cls: int) -> bool
+    if cls < 4096: return (rec_targets(r, cls / 64) >> (cls % 64)) & 1 != 0
+    return under_legal(r, cls - 4096)
+
+# The legal classes of a record, one per call to next() in the order of the record's
+# from-squares, then the underpromotions; -1 after the last.
+#
+#   var moves = LegalMoves(r: record)
+#   var cls = moves.next()
+#   while cls >= 0
+#       ...
+#       cls = moves.next()
+struct LegalMoves
+    r: *u8
+    slot: int = 0
+    from: int = 0
+    targets: u64 = 0
+    under: int = 0
+
+    fn next() -> int
+        while targets == 0
+            if slot >= 16
+                while under < 72
+                    let c = under
+                    under += 1
+                    if under_legal(r, c): return 4096 + c
+                return -1
+            from = r[AtFromSquares + slot] as int
+            targets = from < 64 ? rec_u64(r, AtMoves + 8 * slot) : 0
+            slot += 1
+        let to = targets.first
+        targets &= targets - 1
+        return from * 64 + to

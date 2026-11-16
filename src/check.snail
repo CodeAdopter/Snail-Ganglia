@@ -1,0 +1,326 @@
+# ganglia check: the forward pass against the PyTorch net's float64 values for the same positions,
+# at each stage of the net. The reference files were written from the PyTorch project that Ganglia
+# was ported from, and lie beside the nets they belong to (weights/gnets/checks/*.ref).
+
+use cuda/driver
+use model
+use checkpoint
+use forward
+use backward
+use kernels/optim
+use kernels/records
+use kernels/heads
+
+struct RefEntry
+    name: str
+    kind: int                   # 0 float64, 1 bytes
+    count: i64
+    data: *u8
+
+fn read_reference(path: str) -> [..]RefEntry
+    var entries: [..]RefEntry
+    let data = read_whole(path)
+    if data.len < 8 or data[0..8] as str != "GREF0001": fail2("not a reference file: ", path)
+    var at: i64 = 8
+    while at + 48 <= data.len
+        var n: i64 = 0
+        while n < 32 and data[at + n] != 0
+            n += 1
+        let e = entries.add()
+        e.name = data[at..at + n] as str
+        e.kind = le_i64(data.ptr + at + 32) as int
+        e.count = le_i64(data.ptr + at + 40)
+        e.data = data.ptr + at + 48
+        at += 48 + e.count * (e.kind == 0 ? 8 : 1)
+    return entries
+
+fn entry(entries: []RefEntry, name: str) -> *RefEntry
+    for i in 0..entries.len
+        if entries[i].name == name: return &entries[i]
+    fail2("reference has no entry ", name)
+    return null
+
+# Compares count floats on the GPU with the reference's float64 values; prints the largest
+# difference, the largest reference value, and the RMS difference relative to the RMS value.
+# Passes when that relative difference is below 1e-5.
+fn compare(label: str, got: DeviceMemory, want: *RefEntry) -> bool
+    let n = want.count
+    let host = alloc[f32](n)
+    download(host, got, n * 4)
+    let expected = want.data as *f64
+    var most: f64 = 0.0
+    var biggest: f64 = 0.0
+    var diff2: f64 = 0.0
+    var ref2: f64 = 0.0
+    for i in 0..n
+        let diff = abs(host[i] as f64 - expected[i])
+        most = max(most, diff)
+        biggest = max(biggest, abs(expected[i]))
+        diff2 += diff * diff
+        ref2 += expected[i] * expected[i]
+    free(host)
+    let relative = sqrt(diff2 / max(ref2, 1.0e-300))
+    let ok = relative < 1.0e-5
+    let verdict = ok ? "ok" : "FAIL"
+    print("{label:-10} {n:9} values  max |diff| {most:.2e} of max {biggest:8.3f}  rms rel {relative:.2e}  {verdict}")
+    return ok
+
+fn check_forward(weights: str, reference: str) -> bool
+    var ck = load_checkpoint(weights)
+    var net = gpu_net(&ck)
+    let entries = read_reference(reference)
+    let records = entry(entries, "records")
+    let count = (records.count / Record) as int
+    let cfg = net.cfg
+    print("{weights}: d {cfg.d}, {cfg.layers} layers, {cfg.heads} heads, smolgen {cfg.smolgen}; {count} positions")
+    var p = pass_buffers(cfg, count, false)
+    upload(p.records, records.data, records.count)
+    upload(p.known, entry(entries, "known").data, count)
+    var ok = true
+    forward(&net, &p, count, |stage| ok = check_stage(stage, &net, &p, entries, ok))
+    gpu_sync()
+    let o = &p.out
+    ok = compare("policy", o.policy, entry(entries, "policy")) and ok
+    ok = compare("value", o.value, entry(entries, "value")) and ok
+    ok = compare("time", o.time, entry(entries, "time")) and ok
+    ok = compare("salience", o.salience, entry(entries, "salience")) and ok
+
+    # The legal move each predicts must agree.
+    let best = device_alloc(count * 4)
+    let top3 = device_alloc(count)
+    let loss = device_alloc(count * 4)
+    run_score_moves(count, p.records, o.policy, best, top3, loss)
+    let host_best = alloc[i32](count)
+    download(host_best, best, count * 4)
+    let ref_policy = entry(entries, "policy").data as *f64
+    var agree = 0
+    for i in 0..count
+        let r = records.data + i * Record
+        var top = -1
+        var v: f64 = -1.0e300
+        for cls in 0..Classes
+            if rec_legal(r, cls) and ref_policy[i as i64 * Classes + cls] > v
+                v = ref_policy[i as i64 * Classes + cls]
+                top = cls
+        if top == host_best[i]: agree += 1
+    print("predicted move: {agree} of {count} agree")
+    return ok and agree == count
+
+fn check_stage(stage: int, net: *GpuNet, p: *Pass, entries: []RefEntry, ok: bool) -> bool
+    var good = ok
+    if stage == -1
+        good = compare("condition", p.out.c, entry(entries, "condition")) and good
+        good = compare("tokens", p.x(0), entry(entries, "tokens")) and good
+    elif stage == 0
+        good = compare("block 0", p.x(1), entry(entries, "block0")) and good
+    elif stage == net.cfg.layers - 1
+        good = compare("blocks", p.x(net.cfg.layers), entry(entries, "blocks")) and good
+    return good
+
+# ganglia gradcheck: the losses and every parameter's gradient against the PyTorch net's float64
+# values (a grad reference, *-grad.ref). A tensor passes when its gradient is within 1e-4 RMS of
+# the reference's, relative to the reference's RMS.
+fn check_gradients(weights: str, reference: str) -> bool
+    var ck = load_checkpoint(weights)
+    var net = gpu_net(&ck)
+    let entries = read_reference(reference)
+    let records = entry(entries, "records")
+    let known = entry(entries, "known")
+    let count = (records.count / Record) as int
+    let cfg = net.cfg
+    let l = net.layout
+    print("{weights}: d {cfg.d}, {cfg.layers} layers, {cfg.heads} heads, smolgen {cfg.smolgen}; {count} positions")
+    var p = pass_buffers(cfg, count, true)
+    upload(p.records, records.data, records.count)
+    upload(p.known, known.data, count)
+    forward(&net, &p, count)
+    var g = grad_buffers(cfg, l.total, count)
+    let (results, timed_count) = loss_counts(records.data, known.data, count)
+    let losses = backward(&net, &p, &g, count, LossWeights(), results, timed_count)
+    gpu_sync()
+
+    let want = entry(entries, "losses").data as *f64
+    let got = [losses.policy, losses.value, losses.time, losses.salience, losses.total]
+    let names = ["policy", "value", "time", "salience", "total"]
+    var ok = true
+    for i in 0..5
+        let rel = abs(got[i] - want[i]) / max(abs(want[i]), 1.0e-30)
+        let fine = rel < 1.0e-5
+        ok = ok and fine
+        let verdict = fine ? "ok" : "FAIL"
+        let name = names[i]
+        print("loss {name:-9} {got[i]:.7f}  Python {want[i]:.7f}  rel {rel:.1e}  {verdict}")
+
+    let grad_ref = entry(entries, "grad")
+    if grad_ref.count != l.total: fail2("the reference's gradient has the wrong size for ", weights)
+    let host = alloc[f32](l.total)
+    download(host, g.params, l.total * 4)
+    let expected = grad_ref.data as *f64
+    let rels = alloc[f64](l.params.len)
+    var failed = 0
+    var all_diff2: f64 = 0.0
+    var all_ref2: f64 = 0.0
+    for t in 0..l.params.len
+        let param = &l.params[t]
+        var diff2: f64 = 0.0
+        var ref2: f64 = 0.0
+        for i in param.at..param.at + param.count
+            let diff = host[i] as f64 - expected[i]
+            diff2 += diff * diff
+            ref2 += expected[i] * expected[i]
+        all_diff2 += diff2
+        all_ref2 += ref2
+        rels[t] = ref2 > 0.0 ? sqrt(diff2 / ref2) : sqrt(diff2)
+        if rels[t] >= 1.0e-4: failed += 1
+    # The ten tensors furthest from the reference.
+    print("tensors furthest from the reference:")
+    for k in 0..min(10, l.params.len)
+        var worst = -1
+        for t in 0..l.params.len
+            if rels[t] >= 0.0 and (worst < 0 or rels[t] > rels[worst]): worst = t
+        let name = l.params[worst].name
+        print("  {name:-34} rms rel {rels[worst]:.2e}")
+        rels[worst] = -1.0
+    let overall = sqrt(all_diff2 / all_ref2)
+    print("gradient: {l.params.len} tensors, {failed} beyond 1e-4; all {l.total} values rms rel {overall:.2e}")
+    return ok and failed == 0
+
+# The RMS of a - b relative to the RMS of b over n values, and the same for the worst tensor of
+# layout l, whose name is returned too.
+fn relative_rms(l: *Layout, a: *f64, b: *f64) -> (f64, f64, str)
+    var all_d: f64 = 0.0
+    var all_r: f64 = 0.0
+    var worst: f64 = 0.0
+    var worst_name = ""
+    for t in 0..l.params.len
+        let p = &l.params[t]
+        var d2: f64 = 0.0
+        var r2: f64 = 0.0
+        for i in p.at..p.at + p.count
+            d2 += (a[i] - b[i]) * (a[i] - b[i])
+            r2 += b[i] * b[i]
+        all_d += d2
+        all_r += r2
+        let rel = r2 > 0.0 ? sqrt(d2 / r2) : sqrt(d2)
+        if rel > worst
+            worst = rel
+            worst_name = p.name
+    return sqrt(all_d / all_r), worst, worst_name
+
+# ganglia stepcheck: one optimizer step, the gradient clipped and then AdamW, from a checkpoint
+# with AdamW state. Two checks: the GPU's step must give exactly the bits of the same step
+# computed on the CPU (adamw_update, in f32 on both), and the moments after it must agree with
+# the PyTorch optimizer's step in float64 (a step reference) to within 1e-4 RMS relative, per
+# tensor. With grad_reference (a grad reference for the same weights and positions), the step
+# takes the PyTorch net's gradient rounded to f32 instead of its own, which tests the
+# optimizer alone. The parameters' change against float64 is reported for information: where a
+# change is far smaller than its parameter, or a moment nearly cancels, f32 keeps few of its
+# digits, in PyTorch's f32 optimizer as here.
+fn check_step(checkpoint: str, reference: str, grad_reference: str) -> bool
+    var ck = load_checkpoint(checkpoint)
+    if ck.adam_steps == 0: fail2("no optimizer state in ", checkpoint)
+    var net = gpu_net(&ck)
+    let entries = read_reference(reference)
+    let records = entry(entries, "records")
+    let known = entry(entries, "known")
+    let count = (records.count / Record) as int
+    let cfg = net.cfg
+    let l = net.layout
+    let n = l.total
+    print("{checkpoint}: AdamW at step {ck.adam_steps}; {count} positions")
+    var p = pass_buffers(cfg, count, true)
+    upload(p.records, records.data, records.count)
+    upload(p.known, known.data, count)
+    forward(&net, &p, count)
+    var g = grad_buffers(cfg, n, count)
+    let (results, timed_count) = loss_counts(records.data, known.data, count)
+    backward(&net, &p, &g, count, LossWeights(), results, timed_count)
+    if grad_reference.len > 0
+        let theirs = entry(read_reference(grad_reference), "grad")
+        if theirs.count != n: fail2("the reference's gradient has the wrong size: ", grad_reference)
+        let rounded = alloc[f32](n)
+        for i in 0..n
+            rounded[i] = (theirs.data as *f64)[i] as f32
+        upload(g.params, rounded, n * 4)
+        free(rounded)
+        print("the step takes the Python net's gradient")
+    let grads = alloc[f32](n)
+    download(grads, g.params, n * 4)
+    var opt = new_optimizer(l, AdamW())
+    upload(opt.m, ck.exp_avg, n * 4)
+    upload(opt.v, ck.exp_avg_sq, n * 4)
+    opt.steps = ck.adam_steps
+    let lr = (entry(entries, "lr").data as *f64)[0] as f32
+    optimizer_step(&opt, net.params, g.params, n, lr)
+    gpu_sync()
+
+    var norm2: f64 = 0.0
+    download(&norm2, opt.norm2, 8)
+    let want_norm = (entry(entries, "norm").data as *f64)[0]
+    let norm_rel = abs(sqrt(norm2) - want_norm) / want_norm
+    var ok = norm_rel < 1.0e-5
+    print("gradient norm {sqrt(norm2):.6f}  Python {want_norm:.6f}  rel {norm_rel:.1e}")
+
+    # The same step on the CPU.
+    let got = [alloc[f32](n), alloc[f32](n), alloc[f32](n)]
+    download(got[0], net.params, n * 4)
+    download(got[1], opt.m, n * 4)
+    download(got[2], opt.v, n * 4)
+    let s = opt.settings
+    let coef = clip_factor(norm2, s.max_norm)
+    let (bias1, bias2) = bias_corrections(s, opt.steps)
+    var differ = [0, 0, 0]
+    for t in 0..l.params.len
+        let param = &l.params[t]
+        for i in param.at..param.at + param.count
+            let (np, nm, nv) = adamw_update(ck.params[i], grads[i] * coef, ck.exp_avg[i], ck.exp_avg_sq[i], param.decay, lr, s, bias1, bias2)
+            if np.bits != got[0][i].bits: differ[0] += 1
+            if nm.bits != got[1][i].bits: differ[1] += 1
+            if nv.bits != got[2][i].bits: differ[2] += 1
+    let same = differ[0] == 0 and differ[1] == 0 and differ[2] == 0
+    ok = ok and same
+    let same_verdict = same ? "ok" : "FAIL"
+    print("against the CPU in f32: {differ[0]} parameters, {differ[1]} first and {differ[2]} second moments differ in any bit, of {n}  {same_verdict}")
+
+    let a = alloc[f64](n)
+    let b = alloc[f64](n)
+    let names = ["parameter change", "first moment", "second moment"]
+    let refs = ["params", "exp_avg", "exp_avg_sq"]
+    for k in 0..3
+        let expected = entry(entries, refs[k]).data as *f64
+        for i in 0..n
+            a[i] = got[k][i] as f64
+            b[i] = expected[i]
+            if k == 0
+                a[i] -= ck.params[i] as f64
+                b[i] -= ck.params[i] as f64
+        let (overall, worst, worst_name) = relative_rms(l, a, b)
+        let fine = k == 0 or worst < 1.0e-4
+        ok = ok and fine
+        let verdict = k == 0 ? "(f32's precision)" : fine ? "ok" : "FAIL"
+        let name = names[k]
+        print("{name:-17} against Python in float64: rms rel {overall:.2e}, worst tensor {worst:.2e} ({worst_name})  {verdict}")
+    return ok
+
+# ganglia initloss: the losses of new nets (init_params, seeds 1 to 5) on a reference's positions,
+# to compare with PyTorch's starting nets.
+fn initial_losses(reference: str, width: int, layers: int, heads: int, smolgen: bool)
+    let entries = read_reference(reference)
+    let records = entry(entries, "records")
+    let known = entry(entries, "known")
+    let count = (records.count / Record) as int
+    let cfg = Config(d: width, layers: layers, heads: heads, ffn: 4 * width, dc: 128, dp: 128, smolgen: smolgen)
+    let l = layout_of(cfg)
+    let (results, timed_count) = loss_counts(records.data, known.data, count)
+    var p = pass_buffers(cfg, count, true)
+    var g = grad_buffers(cfg, l.total, count)
+    upload(p.records, records.data, records.count)
+    upload(p.known, known.data, count)
+    var net = GpuNet(cfg: cfg, layout: l, params: device_alloc(l.total * 4))
+    for seed in 1..6
+        let params = init_params(l, seed as u64)
+        upload(net.params, params, l.total * 4)
+        free(params)
+        forward(&net, &p, count)
+        let losses = backward(&net, &p, &g, count, LossWeights(), results, timed_count)
+        print("seed {seed}: policy {losses.policy:.4f} value {losses.value:.4f} time {losses.time:.4f} salience {losses.salience:.3f}")

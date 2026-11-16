@@ -1,0 +1,253 @@
+# ganglia timedata: positions for training and testing the small think-time net (timenet.snail),
+# each with what the full net predicts for it.
+#
+# A time set is a file of rows, one per position:
+#
+#   0     "GTIMESET", i32 the bytes of a row (TimeRow), i32 1 when the rows are every record of a
+#         test file in its order and 0 when they are training positions, 48 zero bytes
+#   64    the rows: the position's 512-byte record (kernels/records.snail), the full net's 32
+#         think-time logits for it with the mover's think time hidden (f32), and four f32 from the
+#         full net's policy: -log of the probability of the move played, the entropy in nats and
+#         the highest probability over the legal moves, and the number of legal moves
+#
+# Training rows come from positions.exe's stream and keep only positions whose think time is
+# known, from each side's second move on (the ones the time loss counts). Test rows keep every
+# record, so row i is record i of the test file.
+#
+# Rows can also be made without the full net, from a file of records: for positions the full net
+# was not trained on, such as bullet's. Their fields after the record are zero, and the zero
+# number of legal moves tells such a row from the others.
+
+use cuda/driver
+use base/stream
+use model
+use checkpoint
+use forward
+use train
+use kernels/records
+use kernels/gemm
+use kernels/layers
+use kernels/heads
+
+const TimeRow = 656
+const TimeSetHeader = 64
+const AtTeacher = 512
+const AtPolicyLoss = 640
+const AtPolicyEntropy = 644
+const AtPolicyTop = 648
+const AtLegalCount = 652
+const AtGameStart = 484         # u32 in the record: when its game started, in seconds since 1970
+
+# One thread per position: the four numbers a row keeps of the full net's policy.
+@kernel
+fn policy_stats(count: int, records: *u8, policy: *f32, out: *f32)
+    let p = block_index().x * block_size().x + thread_index().x
+    if p >= count: return
+    let r = records + p as i64 * Record
+    let row = policy + p as i64 * Classes
+    var most: f32 = -3.0e38
+    var n = 0
+    var moves = LegalMoves(r: r)
+    var cls = moves.next()
+    while cls >= 0
+        most = max(most, row[cls])
+        n += 1
+        cls = moves.next()
+    var total: f32 = 0.0
+    var weighted: f32 = 0.0
+    moves = LegalMoves(r: r)
+    cls = moves.next()
+    while cls >= 0
+        let d = row[cls] - most
+        let e = exp(d)
+        total += e
+        weighted += e * d
+        cls = moves.next()
+    let target = rec_u16(r, AtTarget)
+    let o = out + p * 4
+    if n == 0
+        for i in 0..4
+            o[i] = 0.0
+        return
+    o[0] = target < Classes ? log(total) + most - row[target] : 0.0
+    o[1] = log(total) - weighted / total
+    o[2] = 1.0 / total
+    o[3] = n as f32
+
+fn write_time_header(f: *File, test: bool) -> bool
+    var header: [TimeSetHeader]u8
+    copy(&header[0], "GTIMESET".ptr, 8)
+    put_i32(&header[8], TimeRow)
+    put_i32(&header[12], test ? 1 : 0)
+    return f.write(header[0..TimeSetHeader])
+
+# A time set mapped into memory.
+struct TimeSet
+    rows: *u8
+    count: i64
+    test: bool
+
+    fn row(i: i64) -> *u8
+        return rows + i * TimeRow
+
+fn open_time_set(path: str) -> TimeSet
+    var (mapped, ok) = map_file(path)
+    if not ok: fail2("cannot open ", path)
+    let data = mapped.data
+    if data.len < TimeSetHeader or data[0..8] as str != "GTIMESET": fail2("not a time set: ", path)
+    if le_i32(data.ptr + 8) != TimeRow: fail2("time set with another row size: ", path)
+    return TimeSet(rows: data.ptr + TimeSetHeader, count: (data.len - TimeSetHeader) / TimeRow, test: le_i32(data.ptr + 12) != 0)
+
+# The full net on batches of records, and what a row keeps of its outputs.
+struct Teacher
+    net: GpuNet
+    pass: Pass
+    stats: DeviceMemory         # [batch][4]
+    host_time: *f32
+    host_stats: *f32
+
+fn new_teacher(weights: str, batch: int) -> *Teacher
+    let t = new Teacher
+    var ck = load_checkpoint(weights)
+    t.net = gpu_net(&ck)
+    t.pass = pass_buffers(t.net.cfg, batch, false)
+    t.stats = device_alloc(batch * 16)
+    t.host_time = alloc[f32](batch * TimeBins)
+    t.host_stats = alloc[f32](batch * 4)
+    device_zero(t.pass.known)
+    return t
+
+# Runs the full net on n records at host, with the think time hidden, and brings back its time
+# logits and policy numbers.
+fn teach(t: *Teacher, host: *u8, n: int)
+    upload(t.pass.records, host, n as i64 * Record)
+    forward(&t.net, &t.pass, n)
+    launch(&kernels, blocks_for(n, 128), 128, 0, gpu_args(policy_stats, n, t.pass.records, t.pass.out.policy, t.stats))
+    download(t.host_time, t.pass.out.time, n as i64 * TimeBins * 4)
+    download(t.host_stats, t.stats, n as i64 * 16)
+
+# Row i of the last batch taught, with its record at r, written at out.
+fn fill_row(t: *Teacher, i: int, r: *u8, out: *u8)
+    copy(out, r, Record)
+    copy(out + AtTeacher, (t.host_time + i * TimeBins) as *u8, TimeBins * 4)
+    copy(out + AtPolicyLoss, (t.host_stats + i * 4) as *u8, 16)
+
+# Writes `count` training rows to out from positions.exe's stream of the games in `games`.
+fn build_train_set(weights: str, games: str, positions_exe: str, out: str, count: i64, seed: int, batch: int, stall_seconds: int) -> bool
+    let t = new_teacher(weights, batch)
+    var (file, created) = create_file(out)
+    if not created: fail2("cannot write ", out)
+    if not write_time_header(&file, false): fail2("cannot write ", out)
+    var args: [..]str
+    args.push(games)
+    args.push("train")
+    args.push("--seed")
+    args.push(int_of(seed as i64))
+    var (data, started) = start_process(positions_exe, args)
+    if not started: fail2("cannot start ", positions_exe)
+    let bytes = batch as i64 * Record
+    let records = pinned_alloc(bytes)
+    let staged = alloc[u8](batch as i64 * TimeRow)
+    let watch = new Watch
+    watch.stall_seconds = stall_seconds
+    watch.data = &data
+    if stall_seconds > 0: spawn(watch_run, watch)
+    var written: i64 = 0
+    var read: i64 = 0
+    var batches = 0
+    let start = now_ms()
+    while written < count
+        if data.output.read(records[0..bytes]) != bytes
+            if watch.stalled: quit(3)
+            fail2("positions.exe ended: ", positions_exe)
+        watch.beat += 1
+        teach(t, records, batch)
+        var kept: i64 = 0
+        for i in 0..batch
+            let r = records + i * Record
+            if not timed(r, false) or written + kept >= count: continue
+            fill_row(t, i, r, staged + kept * TimeRow)
+            kept += 1
+        if not file.write(staged[0..kept * TimeRow]): fail2("cannot write ", out)
+        written += kept
+        read += batch
+        batches += 1
+        watch.beat += 1
+        if batches % 500 == 0
+            let seconds = (now_ms() - start) / 1000.0
+            print("{written as f64 / 1.0e6:.2}M rows of {read as f64 / 1.0e6:.2}M positions, {read as f64 / seconds:.0} positions/s")
+    watch.done = true
+    data.stop()
+    file.close()
+    print("{out}: {written} rows from {read} positions in {(now_ms() - start) / 60000.0:.1} min")
+    return true
+
+# Writes a row for every record of the test file `test` to out.
+fn build_test_set(weights: str, test: str, out: str, batch: int) -> bool
+    let t = new_teacher(weights, batch)
+    var (mapped, ok) = map_file(test)
+    if not ok: fail2("cannot open ", test)
+    let total = mapped.data.len / Record
+    var (file, created) = create_file(out)
+    if not created: fail2("cannot write ", out)
+    if not write_time_header(&file, true): fail2("cannot write ", out)
+    let staged = alloc[u8](batch as i64 * TimeRow)
+    let start = now_ms()
+    var at: i64 = 0
+    while at < total
+        let n = min(batch as i64, total - at) as int
+        let chunk = mapped.data.ptr + at * Record
+        teach(t, chunk, n)
+        for i in 0..n
+            fill_row(t, i, chunk + i * Record, staged + i as i64 * TimeRow)
+        if not file.write(staged[0..n as i64 * TimeRow]): fail2("cannot write ", out)
+        at += n
+    file.close()
+    let seconds = (now_ms() - start) / 1000.0
+    print("{out}: {total} rows in {seconds:.0} s, {total as f64 / seconds:.0} positions/s")
+    return true
+
+# The seconds since 1970 at the start of the day written YYYY-MM-DD.
+fn day_start(text: str) -> i64
+    if text.len != 10: fail2("not a date, YYYY-MM-DD: ", text)
+    let year = parse_int(text[0..4])
+    let month = parse_int(text[5..7])
+    let day = parse_int(text[8..10])
+    let y = month <= 2 ? year - 1 : year
+    let era = (y >= 0 ? y : y - 399) / 400
+    let yoe = y - era * 400
+    let doy = (153 * (month > 2 ? month - 3 : month + 9) + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return (era * 146097 + doe - 719468) * 86400
+
+# Writes training rows without the full net's predictions to out, from the records in the file
+# `records`: those whose think time is known from each side's second move on, of time class
+# `speed` (-1 for any) and of games started before the day `before` (any when empty).
+fn build_plain_set(records: str, out: str, speed: int, before: str) -> bool
+    var (mapped, ok) = map_file(records)
+    if not ok: fail2("cannot open ", records)
+    let total = mapped.data.len / Record
+    var (file, created) = create_file(out)
+    if not created: fail2("cannot write ", out)
+    if not write_time_header(&file, false): fail2("cannot write ", out)
+    let limit: i64 = before.len > 0 ? day_start(before) : 0
+    let chunk = 4096
+    let staged = alloc[u8](chunk as i64 * TimeRow)
+    var kept: i64 = 0
+    var held: i64 = 0
+    for i in 0..total
+        let r = mapped.data.ptr + i * Record
+        if not timed(r, false): continue
+        if speed >= 0 and r[AtSpeed] as int != speed: continue
+        if limit > 0 and le_i32(r + AtGameStart) as u32 as i64 >= limit: continue
+        copy(staged + held * TimeRow, r, Record)
+        held += 1
+        kept += 1
+        if held == chunk
+            if not file.write(staged[0..held * TimeRow]): fail2("cannot write ", out)
+            zero(staged, chunk as i64 * TimeRow)
+            held = 0
+    if not file.write(staged[0..held * TimeRow]): fail2("cannot write ", out)
+    file.close()
+    print("{out}: {kept} rows of {total} records")
+    return true

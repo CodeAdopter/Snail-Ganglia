@@ -1,0 +1,292 @@
+# ganglia timetrain, timeeval and timecheck: training the small think-time net (timenet.snail) on a
+# time set, scoring it against real think times, and checking its passes against the CPU.
+#
+# Training reads the rows of its time sets, taken together, in a scattered order (RowOrder), and
+# in another one on each pass over them. AdamW, the gradient's norm clipped
+# to 1, the learning rate warmed up and cosine-decayed as train does. Every eval_every steps the
+# net is scored on the test set's rows at odd places, and saved as last.tnet, and as best.tnet
+# when its 3+0 and 3+2 log loss there is the lowest so far. The run ends with the report of
+# timeeval for best.tnet, on the rows at even places.
+
+use cuda/driver
+use base/sys
+use base/mem
+use base/paths
+use base/text
+use base/stream
+use model
+use checkpoint
+use train
+use timeset
+use timenet
+use timeeval
+use kernels/records
+use kernels/gemm
+use kernels/heads
+use kernels/optim
+use kernels/timefeat
+
+struct TimeTrainSettings
+    run: str = ""
+    train: str = ""
+    val: str = ""
+    groups: int = GroupClock | GroupPace | GroupBoard | GroupMove | GroupSquares | GroupLast | GroupTarget
+    embed: int = 96
+    hidden1: int = 512
+    hidden2: int = 256
+    trunk: int = 0              # the square tokens' transformer: its width (0 for none), layers,
+    trunk_layers: int = 2       # heads, and numbers per square handed on
+    trunk_heads: int = 4
+    trunk_out: int = 4
+    positions: f64 = 40000000.0
+    batch: int = 4096
+    lr: f64 = 0.001
+    wd: f32 = 0.01
+    distill: f64 = 0.0          # the full net's share of the target at the first step
+    distill_end: f64 = -1.0     # and at the last, reached linearly; below 0 for the same
+    seed: int = 1
+    log_every: int = 500
+    eval_every: int = 2000
+
+# The rows of several time sets as one list, in a scattered order: the i-th row read is row
+# i * stride of the list, wrapping around, with stride sharing no factor with the list's length,
+# so that a pass reads every row once. Each pass starts at another row. Rows next to each other in
+# a file, which may come from one game, are thus read far apart.
+struct RowOrder
+    sets: [..]TimeSet
+    total: i64
+    stride: i64
+
+    fn row(i: i64) -> *u8
+        var at = ((i % total) * stride + (i / total) * 7919) % total
+        for k in 0..sets.len
+            if at < sets[k].count: return sets[k].row(at)
+            at -= sets[k].count
+        return sets[0].row(0)
+
+fn common_factor(a: i64, b: i64) -> i64
+    var x = a
+    var y = b
+    while y != 0
+        let t = x % y
+        x = y
+        y = t
+    return x
+
+# The order over the time sets named in paths, separated by commas.
+fn row_order(paths: str) -> *RowOrder
+    let o = new RowOrder
+    let names = split_char(paths, ',')
+    for name in names
+        let set = open_time_set(name)
+        if set.test: fail2("a test file's time set cannot be trained on: ", name)
+        o.sets.push(set)
+        o.total += set.count
+    if o.total == 0: fail2("no training rows in ", paths)
+    o.stride = (o.total as f64 * 0.6180339887) as i64 | 1
+    while common_factor(o.stride, o.total) != 1
+        o.stride += 2
+    return o
+
+const GroupNames = ["clock", "pace", "board", "move", "policy", "squares", "last", "target"]
+
+# The groups named in text, separated by commas.
+fn parse_groups(text: str) -> int
+    var groups = 0
+    let names = split_char(text, ',')
+    for name in names
+        var found = false
+        for i in 0..8
+            if name == GroupNames[i]
+                groups |= 1 << i
+                found = true
+        if not found: fail2("no such input group: ", name)
+    return groups
+
+fn groups_text(groups: int) -> str
+    var out: Text
+    for i in 0..8
+        if groups & (1 << i) == 0: continue
+        if out.len > 0: out.add(",")
+        out.add(GroupNames[i])
+    return out.view()
+
+fn time_train(s: *TimeTrainSettings) -> bool
+    make_dirs(s.run)
+    var (log_file, logging) = append_file(combine(s.run, "log.txt"))
+    if not logging: fail2("cannot write the log in ", s.run)
+    var log = Log(file: log_file)
+    var buffer: [2048]u8
+
+    let train = row_order(s.train)
+    var val = open_time_set(s.val)
+    if not val.test: fail2("--val takes a test file's time set: ", s.val)
+    let dev = eval_set(&val, false)
+    var cfg = TimeConfig(groups: s.groups, embed: s.embed, hidden1: s.hidden1, hidden2: s.hidden2)
+    if s.trunk > 0
+        if s.trunk % 8 != 0 or s.trunk % s.trunk_heads != 0: fail2("the trunk's width must be a multiple of 8 and of its heads: ", int_of(s.trunk as i64))
+        cfg.trunk = s.trunk
+        cfg.trunk_layers = s.trunk_layers
+        cfg.trunk_heads = s.trunk_heads
+        cfg.trunk_out = s.trunk_out
+    let t = time_layout(cfg)
+    let host = time_init(t, s.seed as u64)
+    let batch = s.batch
+    let net = new_time_net(t, host, batch)
+    var opt = new_optimizer(t.opt, AdamW(weight_decay: s.wd))
+    let steps = (s.positions / batch as f64) as i64
+    let warmup = min(1000, steps / 10)
+    let distill_end = s.distill_end >= 0.0 ? s.distill_end : s.distill
+    var shape: [128]u8
+    let trunk = cfg.trunk > 0 ? format(&shape, ", trunk {cfg.trunk_layers} x {cfg.trunk} ({cfg.trunk_heads} heads, {cfg.trunk_out} out)") : ""
+    log.say(format(&buffer, "params {t.total} ({t.total as f64 * 4.0 / 1048576.0:.2} MB)  inputs {groups_text(s.groups)}  embed {s.embed}{trunk}, hidden {s.hidden1} and {s.hidden2}  batch {batch}, {steps} steps, lr {s.lr:g}, distill {s.distill:g} to {distill_end:g}, seed {s.seed}  train {s.train} ({train.total} rows)  val {s.val} ({dev.count} rows scored while training)  run {s.run}"))
+
+    let host_loss = alloc[f32](batch * 2)
+    var hard = 0.0
+    var soft = 0.0
+    var best = 1.0e9
+    let staged = pinned_alloc(batch as i64 * TimeRow)
+    let start = now_ms()
+    for step in 0..steps
+        for i in 0..batch
+            copy(staged + i as i64 * TimeRow, train.row(step * batch + i), TimeRow)
+        upload(net.rows, staged, batch as i64 * TimeRow)
+        let progress = step as f64 / max(steps - 1, 1) as f64
+        let distill = s.distill + (distill_end - s.distill) * progress
+        let lr = lr_at(s.lr, step, steps, warmup)
+        time_forward(net, batch)
+        let (h, k) = time_backward(net, batch, distill as f32, host_loss)
+        optimizer_step(&opt, net.params, net.grads, t.total, lr as f32)
+        hard += h
+        soft += k
+        let done = step + 1
+        if done % s.log_every == 0
+            let n = s.log_every as f64 * batch as f64 * 0.6931471805599453
+            let rate = done as f64 * batch as f64 / ((now_ms() - start) / 1000.0)
+            log.say(format(&buffer, "step {done}/{steps}  pos {done as f64 * batch as f64 / 1.0e6:.1}M  {rate:.0} pos/s  lr {lr:.2e}  real bin {hard / n:.4} bits  from the full net {soft / n:.4} bits"))
+            hard = 0.0
+            soft = 0.0
+        if done % s.eval_every == 0 or done == steps
+            let probs = net_probs(net, dev)
+            let (line, first) = loss_line(probs, dev)
+            free(probs)
+            log.say(format(&buffer, "eval step {done}  {line}"))
+            download(host, net.params, t.total * 4)
+            if not save_time_net(combine(s.run, "last.tnet"), t, host, first): fail2("cannot save in ", s.run)
+            if first < best
+                best = first
+                if not save_time_net(combine(s.run, "best.tnet"), t, host, first): fail2("cannot save in ", s.run)
+    log.say(format(&buffer, "done in {(now_ms() - start) / 60000.0:.1} min, best {best:.4} bits on 3+0 and 3+2 while training"))
+    log.file.close()
+    return time_evaluate(combine(s.run, "best.tnet"), s.val, combine(s.run, "report.json"), batch)
+
+# Scores the net in `path` and the full net on the test time set `val`'s rows at even places, and
+# writes the charts' numbers to json unless it is empty.
+fn time_evaluate(path: str, val_path: str, json: str, batch: int, row_scores: str = "", row_probs: str = "") -> bool
+    var val = open_time_set(val_path)
+    if not val.test: fail2("not a test file's time set: ", val_path)
+    let e = eval_set(&val, true)
+    let (t, host) = load_time_net(path)
+    let net = new_time_net(t, host, batch)
+    print("{path}: {t.total} parameters ({t.total as f64 * 4.0 / 1048576.0:.2} MB), inputs {groups_text(t.cfg.groups)}")
+    var scored: [..]Scored
+    scored.push(Scored(name: "Small net", probs: net_probs(net, e)))
+    scored.push(Scored(name: "Full net", probs: teacher_probs(e)))
+    time_report(e, scored, json)
+    if row_scores.len > 0: write_row_scores(e, scored, row_scores)
+    if row_probs.len > 0: write_row_probs(e, scored, row_probs)
+    return true
+
+# Checks the passes on `count` rows of a time set with a small net of every input group, without
+# a trunk and with one: the GPU's logits against the CPU's, and the gradient against differences
+# of the CPU's loss.
+fn time_check(set_path: str, count: int) -> bool
+    let plain = time_check_net(set_path, count, TimeConfig(groups: AllGroups, embed: 8, hidden1: 16, hidden2: 12))
+    let trunk = time_check_net(set_path, count, TimeConfig(groups: AllGroups, embed: 8, hidden1: 16, hidden2: 12, trunk: 16, trunk_layers: 2, trunk_heads: 2, trunk_out: 2))
+    return plain and trunk
+
+fn time_check_net(set_path: str, count: int, cfg: TimeConfig) -> bool
+    var set = open_time_set(set_path)
+    let t = time_layout(cfg)
+    let host = time_init(t, 7)
+    print("embed {cfg.embed}, trunk {cfg.trunk} x {cfg.trunk_layers}, hidden {cfg.hidden1} and {cfg.hidden2}: {t.total} parameters")
+    # Larger weights than a new net's, and the tensors that start at zero filled, so every layer
+    # matters to the loss.
+    var fill = Random(state: 5)
+    for i in 0..t.total
+        host[i] = host[i] == 0.0 ? (fill.unit() - 0.5) as f32 : host[i] * 3.0
+    let net = new_time_net(t, host, count)
+    let distill = 0.3
+    upload(net.rows, set.rows, count as i64 * TimeRow)
+    time_forward(net, count)
+    let host_loss = alloc[f32](count * 2)
+    time_backward(net, count, distill as f32, host_loss)
+    let logits = alloc[f32](count * TimeBins)
+    let grads = alloc[f32](t.total)
+    download(logits, net.logits, count as i64 * TimeBins * 4)
+    download(grads, net.grads, t.total * 4)
+
+    var worst_logit = 0.0
+    var x: [TimeBins]f64
+    for i in 0..count
+        time_logits(t, host, set.row(i), &x[0])
+        for j in 0..TimeBins
+            worst_logit = max(worst_logit, abs(x[j] - logits[i * TimeBins + j] as f64))
+    print("logits, GPU against CPU: largest difference {worst_logit:.2e}")
+
+    var rng = Random(state: 11)
+    var worst = 0.0
+    var checked = 0
+    var nonzero = 0
+    let step = 0.001
+    for tensor in 0..t.opt.params.len
+        let p = &t.opt.params[tensor]
+        var worst_here = 0.0
+        for k in 0..24
+            let i = p.at + (rng.next() % p.count as u64) as i64
+            let kept = host[i]
+            var up = 0.0
+            var down = 0.0
+            host[i] = kept + step as f32
+            let plus = host[i] as f64
+            for r in 0..count
+                up += time_row_loss(t, host, set.row(r), distill)
+            host[i] = kept - step as f32
+            let minus = host[i] as f64
+            for r in 0..count
+                down += time_row_loss(t, host, set.row(r), distill)
+            host[i] = kept
+            let numeric = (up - down) / (plus - minus) / count as f64
+            let diff = abs(numeric - grads[i] as f64)
+            worst_here = max(worst_here, diff / (abs(numeric) + 0.0001))
+            checked += 1
+            if abs(numeric) > 0.000001: nonzero += 1
+        print("{p.name:-16} largest relative difference {worst_here:.2e}")
+        worst = max(worst, worst_here)
+    print("gradient, GPU against differences of the CPU's loss: {checked} values ({nonzero} not zero), largest relative difference {worst:.2e}")
+    let good = worst_logit < 0.001 and worst < 0.02
+    print(good ? "ok" : "MISMATCH")
+    return good
+
+# Writes, for the first `count` rows of a time set, the inputs of the net in net_path and the
+# logits it gives them, computed on the CPU: DenseFeatures, HotFeatures and TimeBins f32 a row,
+# for another implementation of the net to compare with its own.
+fn time_dump(set_path: str, net_path: str, count: int, out_path: str) -> bool
+    var set = open_time_set(set_path)
+    let (t, host) = load_time_net(net_path)
+    var (f, ok) = create_file(out_path)
+    if not ok: fail2("cannot write ", out_path)
+    var dense: [DenseFeatures]f32
+    var hot: [HotFeatures]f32
+    var x: [TimeBins]f64
+    var logits: [TimeBins]f32
+    for i in 0..min(count as i64, set.count)
+        time_features(set.row(i), t.cfg.groups, &dense[0], &hot[0])
+        time_logits(t, host, set.row(i), &x[0])
+        for j in 0..TimeBins
+            logits[j] = x[j] as f32
+        f.write((&dense[0] as *u8)[0..DenseFeatures * 4])
+        f.write((&hot[0] as *u8)[0..HotFeatures * 4])
+        f.write((&logits[0] as *u8)[0..TimeBins * 4])
+    f.close()
+    return true

@@ -1,0 +1,5 @@
+# Ganglia, the human-move model, in Snail (README.md).
+main = "src/main.snail"
+output = "build/ganglia.exe"
+gpu_arch = "sm_80"    # bf16 tensor cores (warp_mma): RTX 30 series and newer
+libs = ["base", "cuda"]

@@ -1,0 +1,397 @@
+# Matrix products: in f32, the reference the tensor cores are checked against, and in bf16 on the
+# tensor cores. tensor_cores chooses which gemm and linear use.
+
+use cuda/driver
+
+# Time spent per kind of work (ganglia profile): mark charges the time since the previous mark to
+# its name, waiting for the GPU first. Without a profile, mark does nothing.
+struct Profile
+    names: [64]str
+    ms: [64]f64
+    count: int
+    last: f64
+
+var profiling: *Profile = null
+
+# With tracing, mark instead waits for the GPU and prints its name, so the last name printed
+# before a fault or a stall is the work that caused it (train --trace-from).
+var tracing = false
+
+fn mark(name: str)
+    if tracing
+        gpu_sync()
+        print("  done: {name}")
+        return
+    if profiling == null: return
+    gpu_sync()
+    let now = now_ms()
+    var at = -1
+    for i in 0..profiling.count
+        if profiling.names[i] == name: at = i
+    if at < 0 and profiling.count < 64
+        at = profiling.count
+        profiling.names[at] = name
+        profiling.count += 1
+    if at >= 0: profiling.ms[at] += now - profiling.last
+    profiling.last = now
+
+# Whether gemm and linear run on the tensor cores (eval and train) or in f32 (the checks against
+# reference files, and --f32).
+var tensor_cores = false
+
+const GemmTile = 64
+const GemmDepth = 16
+
+@shared
+var gemm_a: [GemmDepth * GemmTile]f32     # [depth][row]
+@shared
+var gemm_b: [GemmDepth * GemmTile]f32     # [depth][column]
+
+# c = scale * a b + bias + beta * c, for an m x k matrix a and a k x n matrix b, one 64 x 64 tile
+# of c per block of 256 threads, each thread computing 4 x 4 of it, and one product per
+# block_index().z. Element (i, j) of a is at a[z * a_batch + i * a_row + j * a_col], of b at
+# b[z * b_batch + i * b_row + j * b_col], and of c at c[z * c_batch + i * c_row + j]. bias, unless
+# null, is a row of n added to every row. Products use fma, rounding once per step.
+@kernel
+fn gemm_f32(m: int, n: int, k: int, a: *f32, a_row: int, a_col: int, a_batch: i64, b: *f32, b_row: int, b_col: int, b_batch: i64, c: *f32, c_row: int, c_batch: i64, bias: *f32, scale: f32, beta: f32)
+    let t = thread_index().x
+    let row0 = block_index().y * GemmTile
+    let col0 = block_index().x * GemmTile
+    let z = block_index().z as i64
+    let pa = a + z * a_batch
+    let pb = b + z * b_batch
+    let pc = c + z * c_batch
+    let tr = (t / 16) * 4
+    let tc = (t % 16) * 4
+    var acc: [16]f32
+    var k0 = 0
+    while k0 < k
+        # Each thread loads 4 of the 1024 elements of each tile. Consecutive threads take
+        # consecutive addresses in whichever direction the matrix is contiguous.
+        for e in 0..4
+            let slot = t + e * 256
+            var i = slot / GemmDepth
+            var j = slot % GemmDepth
+            if a_col != 1
+                i = slot % GemmTile
+                j = slot / GemmTile
+            let gi = row0 + i
+            let gj = k0 + j
+            gemm_a[j * GemmTile + i] = gi < m and gj < k ? pa[gi as i64 * a_row + gj as i64 * a_col] : 0.0
+        for e in 0..4
+            let slot = t + e * 256
+            var i = slot % GemmDepth
+            var j = slot / GemmDepth
+            if b_row != 1
+                i = slot / GemmTile
+                j = slot % GemmTile
+            let gi = k0 + i
+            let gj = col0 + j
+            gemm_b[i * GemmTile + j] = gi < k and gj < n ? pb[gi as i64 * b_row + gj as i64 * b_col] : 0.0
+        sync_threads()
+        for kk in 0..GemmDepth
+            var av: [4]f32
+            var bv: [4]f32
+            for x in 0..4
+                av[x] = gemm_a[kk * GemmTile + tr + x]
+                bv[x] = gemm_b[kk * GemmTile + tc + x]
+            for x in 0..4
+                for y in 0..4
+                    acc[x * 4 + y] = fma(av[x], bv[y], acc[x * 4 + y])
+        sync_threads()
+        k0 += GemmDepth
+    for x in 0..4
+        let gi = row0 + tr + x
+        if gi < m
+            for y in 0..4
+                let gj = col0 + tc + y
+                if gj < n
+                    var v = acc[x * 4 + y] * scale
+                    if bias != null: v += bias[gj]
+                    let at = gi as i64 * c_row + gj
+                    if beta != 0.0: v += beta * pc[at]
+                    pc[at] = v
+
+# The kernels of this program, loaded once by gpu_start.
+var kernels: Module
+
+# A device pointer that kernels read as null.
+fn none() -> DeviceMemory
+    return DeviceMemory(ptr: 0, bytes: 0)
+
+# The device memory from float offset floats of m.
+fn floats(m: DeviceMemory, at: i64) -> DeviceMemory
+    return m.at(at * 4)
+
+# y[rows][n] = x[rows][k] w^T + bias, with w [n][k] (PyTorch's Linear) and bias [n] or none().
+fn linear(x: DeviceMemory, w: DeviceMemory, bias: DeviceMemory, y: DeviceMemory, rows: int, k: int, n: int)
+    gemm(rows, n, k, x, k, 1, 0, w, 1, k, 0, y, n, 0, 1, 1.0, 0.0, bias)
+
+# The general product (gemm_f32 or gemm_bf16), count times over the batch strides, adding beta
+# times what c held and bias, unless none(), to each row.
+fn gemm(m: int, n: int, k: int, a: DeviceMemory, a_row: int, a_col: int, a_batch: i64, b: DeviceMemory, b_row: int, b_col: int, b_batch: i64, c: DeviceMemory, c_row: int, c_batch: i64, count: int, scale: f32, beta: f32 = 0.0, bias: DeviceMemory = none())
+    if tensor_cores
+        gemm_mma(m, n, k, a, a_row, a_col, a_batch, b, b_row, b_col, b_batch, c, c_row, c_batch, count, scale, beta, bias)
+        return
+    launch_on(&kernels, Stream(handle: null), (n + 63) / 64, (m + 63) / 64, count, 256, 1, 1, 0,
+        gpu_args(gemm_f32, m, n, k, a, a_row, a_col, a_batch, b, b_row, b_col, b_batch, c, c_row, c_batch, bias, scale, beta))
+
+# out[j] += the sum over rows of x[row][j], for rows of n. Each block sums 256 columns over 128
+# rows and adds them with atomics, so the order of the additions varies from run to run.
+@kernel
+fn column_sums(rows: int, n: int, x: *f32, out: *f32)
+    let j = block_index().x * 256 + thread_index().x
+    if j >= n: return
+    let first = block_index().y * 128
+    let last = min(first + 128, rows)
+    var s: f32 = 0.0
+    for r in first..last
+        s += x[r as i64 * n + j]
+    atomic_add(&out[j], s)
+
+# column_sums' first step for many rows, without atomics, which blocks by the hundred adding to
+# the same floats make slow: out[r][j] = the sum over rows r * 128 .. r * 128 + 127 of x[row][j].
+@kernel
+fn column_partials(rows: int, n: int, x: *f32, out: *f32)
+    let j = block_index().x * 256 + thread_index().x
+    if j >= n: return
+    let first = block_index().y * 128
+    let last = min(first + 128, rows)
+    var s: f32 = 0.0
+    for r in first..last
+        s += x[r as i64 * n + j]
+    out[block_index().y as i64 * n + j] = s
+
+# The partial sums of column_partials, kept between launches: two, for sums of sums.
+var column_scratch: [2]DeviceMemory
+
+# out[j] += the sum over rows of x[row][j]. More than 1024 rows are first summed 128 at a time.
+fn run_column_sums(rows: int, n: int, x: DeviceMemory, out: DeviceMemory)
+    var from = x
+    var left = rows
+    var level = 0
+    while left > 1024
+        let parts = (left + 127) / 128
+        let to = &column_scratch[level % 2]
+        if to.bytes < parts as i64 * n * 4
+            device_free(to)
+            to[0] = device_alloc(parts as i64 * n * 4)
+        launch_on(&kernels, Stream(handle: null), (n + 255) / 256, parts, 1, 256, 1, 1, 0,
+            gpu_args(column_partials, left, n, from, to[0]))
+        from = to[0]
+        left = parts
+        level += 1
+    launch_on(&kernels, Stream(handle: null), (n + 255) / 256, (left + 127) / 128, 1, 256, 1, 1, 0,
+        gpu_args(column_sums, left, n, from, out))
+
+# The backward pass of linear (y = x w^T + bias, w [n][k]) for the gradient dy of y: adds
+# dy^T x to dw and the column sums of dy to db (unless db is none()), and sets dx = dy w, or adds it
+# to dx when accumulate is set. dx may be none() when the gradient of x is not needed.
+fn linear_backward(dy: DeviceMemory, x: DeviceMemory, w: DeviceMemory, dw: DeviceMemory, db: DeviceMemory, dx: DeviceMemory, rows: int, k: int, n: int, accumulate: bool = false)
+    gemm(n, k, rows, dy, 1, n, 0, x, k, 1, 0, dw, k, 0, 1, 1.0, 1.0)
+    if db.ptr != 0: run_column_sums(rows, n, dy, db)
+    if dx.ptr != 0: gemm(rows, k, n, dy, n, 1, 0, w, k, 1, 0, dx, k, 0, 1, 1.0, accumulate ? 1.0 : 0.0)
+
+# ---- the tensor cores ---------------------------------------------------------------------------
+#
+# Matrix products with bf16 inputs and f32 accumulation (warp_mma, mma.sync m16n8k16), as
+# PyTorch's autocast computes a Linear in bfloat16.
+#
+# Each block computes a 128 x 128 tile of c with 8 warps of 64 x 32, stepping through k 32 at a
+# time. Each step's tiles of a and b are read from GPU memory as f32, rounded to bf16 and kept in
+# shared memory with k contiguous, in two buffers: the values of the next step are read into
+# registers before this step's multiplies and stored after them, so the reads overlap the
+# multiplies. The fragments warp_mma takes then read pairs of bf16 along k as 32-bit words. Every
+# loop over a thread's arrays is unrolled, so they stay in registers.
+
+const MmaTile = 128
+const MmaDepth = 32
+const MmaRow = MmaDepth / 2 + 4      # u32 words per tile row: 16 pairs of bf16, plus 4 so that the
+                                     # 8 rows a fragment load touches fall in different banks
+const MmaStage = 2 * MmaTile * MmaRow  # u32 words of one step's two tiles
+
+fn mma_shared_bytes() -> int
+    return 2 * MmaStage * 4
+
+fn bf16_lo(w: u32) -> bf16
+    return bf16.from_bits((w & 0xFFFF) as u16)
+
+fn bf16_hi(w: u32) -> bf16
+    return bf16.from_bits((w >> 16) as u16)
+
+# The 16 values of one step's tile of an operand that this thread moves: element (r, kk) of the
+# operand is at m[r * r_stride + kk * k_stride], for rows r0.. of rows and k from k0 of depth, 0
+# outside. When k is contiguous, a warp reads 32 consecutive k of one row at a time; otherwise 32
+# consecutive rows of one k.
+fn fetch(m: *f32, r0: int, k0: int, rows: int, depth: int, r_stride: int, k_stride: int, v: *[16]f32)
+    let t = thread_index().x
+    @unroll
+    for e in 0..16
+        var r = t / 32 + 8 * e
+        var kk = t % 32
+        if k_stride != 1
+            r = t % MmaTile
+            kk = t / MmaTile + 2 * e
+        let i = r0 + r
+        let j = k0 + kk
+        v[e] = i < rows and j < depth ? m[i as i64 * r_stride + j as i64 * k_stride] : 0.0
+
+# Stores what fetch read into a tile of shared memory as bf16, row r at r * MmaRow words.
+fn stash(tile: *u32, k_stride: int, v: *[16]f32)
+    let t = thread_index().x
+    let halves = tile as *u16
+    @unroll
+    for e in 0..16
+        var r = t / 32 + 8 * e
+        var kk = t % 32
+        if k_stride != 1
+            r = t % MmaTile
+            kk = t / MmaTile + 2 * e
+        halves[r * 2 * MmaRow + kk] = (v[e] as bf16).bits
+
+# c = scale * a b + bias + beta * c, with the operands laid out as for gemm_f32, the products of
+# bf16-rounded a and b accumulated in f32. One block per 128 x 128 tile of c and per
+# block_index().z, 256 threads, mma_shared_bytes() of dynamic shared memory.
+#
+# With partial not null, block_index().z instead splits the sum over k into pieces of k_per,
+# for a single product with few tiles and a long k (a weight's gradient sums over every row of
+# the batch): each block writes its piece's raw sums to partial[z][m][n], and split_sum adds them.
+@kernel
+fn gemm_bf16(m: int, n: int, k: int, a: *f32, a_row: int, a_col: int, a_batch: i64, b: *f32, b_row: int, b_col: int, b_batch: i64, c: *f32, c_row: int, c_batch: i64, bias: *f32, scale: f32, beta: f32, k_per: int, partial: *f32)
+    let warp = thread_index().x / 32
+    let lane = lane_index()
+    let g = lane / 4
+    let t2 = lane % 4
+    let row0 = block_index().y * MmaTile
+    let col0 = block_index().x * MmaTile
+    let split = partial != null
+    let z = block_index().z as i64
+    let zb = split ? 0 : z
+    let pa = a + zb * a_batch
+    let pb = b + zb * b_batch
+    let pc = c + zb * c_batch
+    let k_start = split ? z as int * k_per : 0
+    let k_end = split ? min(k, k_start + k_per) : k
+    let wm = (warp / 4) * 64             # the warp's 64 x 32 piece of the tile
+    let wn = (warp % 4) * 32
+    let shared = shared_memory[u32]()
+    var acc: [4][4][4]f32
+    var va: [16]f32
+    var vb: [16]f32
+    let steps = (k_end - k_start + MmaDepth - 1) / MmaDepth
+    fetch(pa, row0, k_start, m, k_end, a_row, a_col, &va)
+    fetch(pb, col0, k_start, n, k_end, b_col, b_row, &vb)
+    stash(shared, a_col, &va)
+    stash(shared + MmaTile * MmaRow, b_row, &vb)
+    sync_threads()
+    for s in 0..steps
+        let more = s + 1 < steps
+        if more
+            fetch(pa, row0, k_start + (s + 1) * MmaDepth, m, k_end, a_row, a_col, &va)
+            fetch(pb, col0, k_start + (s + 1) * MmaDepth, n, k_end, b_col, b_row, &vb)
+        let ta = shared + (s % 2) * MmaStage
+        let tb = ta + MmaTile * MmaRow
+        @unroll
+        for kh in 0..2
+            let kw = kh * 8 + t2              # this lane's word of k within the step
+            var fa: [4][8]bf16
+            var fb: [4][4]bf16
+            @unroll
+            for i in 0..4
+                let r = wm + i * 16 + g
+                let w0 = ta[r * MmaRow + kw]
+                let w1 = ta[(r + 8) * MmaRow + kw]
+                let w2 = ta[r * MmaRow + kw + 4]
+                let w3 = ta[(r + 8) * MmaRow + kw + 4]
+                fa[i][0] = bf16_lo(w0)
+                fa[i][1] = bf16_hi(w0)
+                fa[i][2] = bf16_lo(w1)
+                fa[i][3] = bf16_hi(w1)
+                fa[i][4] = bf16_lo(w2)
+                fa[i][5] = bf16_hi(w2)
+                fa[i][6] = bf16_lo(w3)
+                fa[i][7] = bf16_hi(w3)
+            @unroll
+            for j in 0..4
+                let col = wn + j * 8 + g
+                let w0 = tb[col * MmaRow + kw]
+                let w1 = tb[col * MmaRow + kw + 4]
+                fb[j][0] = bf16_lo(w0)
+                fb[j][1] = bf16_hi(w0)
+                fb[j][2] = bf16_lo(w1)
+                fb[j][3] = bf16_hi(w1)
+            @unroll
+            for i in 0..4
+                @unroll
+                for j in 0..4
+                    warp_mma(&acc[i][j], &fa[i], &fb[j])
+        if more
+            let next = shared + ((s + 1) % 2) * MmaStage
+            stash(next, a_col, &va)
+            stash(next + MmaTile * MmaRow, b_row, &vb)
+        sync_threads()
+    @unroll
+    for i in 0..4
+        @unroll
+        for j in 0..4
+            @unroll
+            for e in 0..4
+                let gi = row0 + wm + i * 16 + g + (e >= 2 ? 8 : 0)
+                let gj = col0 + wn + j * 8 + t2 * 2 + (e & 1)
+                if split and gi < m and gj < n
+                    partial[(z * m + gi) * n + gj] = acc[i][j][e]
+                elif gi < m and gj < n
+                    var v = acc[i][j][e] * scale
+                    if bias != null: v += bias[gj]
+                    let at = gi as i64 * c_row + gj
+                    if beta != 0.0: v += beta * pc[at]
+                    pc[at] = v
+
+# c[i][j] = scale * the sum over splits of partial[z][i][j] + bias[j] + beta * c[i][j], in the
+# order of z, so the result does not depend on which block finished first.
+@kernel
+fn split_sum(m: int, n: int, splits: int, partial: *f32, c: *f32, c_row: int, bias: *f32, scale: f32, beta: f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i >= m * n: return
+    var s: f32 = 0.0
+    for z in 0..splits
+        s += partial[z as i64 * m * n + i]
+    let row = i / n
+    let col = i - row * n
+    var v = s * scale
+    if bias != null: v += bias[col]
+    let at = row as i64 * c_row + col
+    if beta != 0.0: v += beta * c[at]
+    c[at] = v
+
+# The partial sums of split products, kept between launches and grown when a product needs more.
+var split_scratch: DeviceMemory
+
+# How many pieces to split a product's k into: enough for about two blocks per multiprocessor
+# when its tiles alone are fewer, with at least 1024 of k per piece.
+const SplitTarget = 168
+
+fn split_count(m: int, n: int, k: int, count: int) -> int
+    if count != 1: return 1
+    let tiles = ((m + MmaTile - 1) / MmaTile) * ((n + MmaTile - 1) / MmaTile)
+    if tiles >= SplitTarget / 2: return 1
+    return max(1, min((SplitTarget + tiles - 1) / tiles, k / 1024))
+
+# gemm on the tensor cores (gemm_bf16) whatever tensor_cores says, with the same arguments.
+fn gemm_mma(m: int, n: int, k: int, a: DeviceMemory, a_row: int, a_col: int, a_batch: i64, b: DeviceMemory, b_row: int, b_col: int, b_batch: i64, c: DeviceMemory, c_row: int, c_batch: i64, count: int, scale: f32, beta: f32 = 0.0, bias: DeviceMemory = none())
+    let grid_x = (n + MmaTile - 1) / MmaTile
+    let grid_y = (m + MmaTile - 1) / MmaTile
+    let splits = split_count(m, n, k, count)
+    if splits == 1
+        launch_on(&kernels, Stream(handle: null), grid_x, grid_y, count, 256, 1, 1, mma_shared_bytes(),
+            gpu_args(gemm_bf16, m, n, k, a, a_row, a_col, a_batch, b, b_row, b_col, b_batch, c, c_row, c_batch, bias, scale, beta, 0, none()))
+        return
+    let k_per = ((k + splits - 1) / splits + MmaDepth - 1) / MmaDepth * MmaDepth
+    let pieces = (k + k_per - 1) / k_per
+    let bytes = pieces as i64 * m * n * 4
+    if split_scratch.bytes < bytes
+        device_free(&split_scratch)
+        split_scratch = device_alloc(bytes)
+    launch_on(&kernels, Stream(handle: null), grid_x, grid_y, pieces, 256, 1, 1, mma_shared_bytes(),
+        gpu_args(gemm_bf16, m, n, k, a, a_row, a_col, a_batch, b, b_row, b_col, b_batch, c, c_row, c_batch, bias, scale, beta, k_per, split_scratch))
+    launch(&kernels, (m * n + 255) / 256, 256, 0, gpu_args(split_sum, m, n, pieces, split_scratch, c, c_row, bias, scale, beta))

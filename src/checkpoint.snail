@@ -1,0 +1,85 @@
+# Checkpoints: a net's sizes and parameters, and optionally its AdamW state.
+#
+# The format, all little-endian:
+#
+#   0     "GANGLIA2"
+#   8     eight i32: d, layers, heads, ffn, dc, dp, smolgen (0 or 1), and flags: 1 when bullet has
+#         rating and clock tables of its own
+#   40    i64 training steps taken
+#   48    i64 parameter count, in floats
+#   56    i64 AdamW steps taken; 0 when no optimizer state follows
+#   64    f64 blitz top-1 of the evaluation the checkpoint was saved at, 0 when none
+#   72    56 zero bytes
+#   128   the parameters as f32, in the order of model.snail's layout
+#         then, when AdamW steps > 0, its first and second moments, each in the same order
+#
+# A quantized net (quantized.snail) is read as the checkpoint it was made from, with the
+# parameters it stores.
+
+use base/sys
+use base/stream
+use bytes
+use model
+use quantized
+
+struct Checkpoint
+    cfg: Config
+    step: i64
+    floats: i64
+    adam_steps: i64
+    metric: f64                 # blitz top-1 when saved, 0 when unknown
+    params: *f32
+    exp_avg: *f32               # null without optimizer state
+    exp_avg_sq: *f32
+
+# Reads a checkpoint; ends the program with the reason when the file is not one.
+fn load_checkpoint(path: str) -> Checkpoint
+    let data = unquantized(read_whole(path), path)
+    if data.len < 128 or data[0..8] as str != "GANGLIA2": fail2("not a Ganglia checkpoint: ", path)
+    let p = data.ptr
+    var ck: Checkpoint
+    ck.cfg = Config(d: le_i32(p + 8), layers: le_i32(p + 12), heads: le_i32(p + 16), ffn: le_i32(p + 20),
+        dc: le_i32(p + 24), dp: le_i32(p + 28), smolgen: le_i32(p + 32) != 0, bullet_tables: le_i32(p + 36) & 1 != 0)
+    ck.step = le_i64(p + 40)
+    ck.floats = le_i64(p + 48)
+    ck.adam_steps = le_i64(p + 56)
+    ck.metric = f64.from_bits(le_i64(p + 64) as u64)
+    let parts: i64 = ck.adam_steps > 0 ? 3 : 1
+    if data.len != 128 + parts * ck.floats * 4: fail2("checkpoint has the wrong size: ", path)
+    let layout = layout_of(ck.cfg)
+    if layout.total != ck.floats: fail2("checkpoint does not match its sizes: ", path)
+    # The buffer is kept for the whole run, so the tensors can point into it.
+    ck.params = (p + 128) as *f32
+    if ck.adam_steps > 0
+        ck.exp_avg = ck.params + ck.floats
+        ck.exp_avg_sq = ck.exp_avg + ck.floats
+    return ck
+
+# Writes a checkpoint: the parameters, and the AdamW moments when exp_avg is not null. The file is
+# written beside its final name and then moved there, so a crash leaves the old checkpoint whole.
+fn save_checkpoint(path: str, cfg: Config, step: i64, floats: i64, params: *f32, exp_avg: *f32, exp_avg_sq: *f32, adam_steps: i64, metric: f64) -> bool
+    var header: [128]u8
+    copy(&header[0], "GANGLIA2".ptr, 8)
+    put_i32(&header[8], cfg.d)
+    put_i32(&header[12], cfg.layers)
+    put_i32(&header[16], cfg.heads)
+    put_i32(&header[20], cfg.ffn)
+    put_i32(&header[24], cfg.dc)
+    put_i32(&header[28], cfg.dp)
+    put_i32(&header[32], cfg.smolgen ? 1 : 0)
+    put_i32(&header[36], cfg.bullet_tables ? 1 : 0)
+    put_i64(&header[40], step)
+    put_i64(&header[48], floats)
+    put_i64(&header[56], exp_avg != null ? adam_steps : 0)
+    put_i64(&header[64], metric.bits as i64)
+    var buffer: [4096]u8
+    let partial = format(&buffer, "{path}.part")
+    var (f, ok) = create_file(partial)
+    if not ok: return false
+    var good = f.write(header[0..128]) and f.write((params as *u8)[0..floats * 4])
+    if exp_avg != null
+        good = good and f.write((exp_avg as *u8)[0..floats * 4]) and f.write((exp_avg_sq as *u8)[0..floats * 4])
+    f.close()
+    if not good: return false
+    delete_file(path)
+    return move_file(partial, path)

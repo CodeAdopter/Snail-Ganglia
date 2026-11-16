@@ -1,0 +1,197 @@
+# The policy head's underpromotions, scoring the policy against the move played, and the four
+# losses (train.py's losses()) with their gradients.
+
+use cuda/driver
+use model
+use kernels/records
+use kernels/gemm
+use kernels/layers
+
+# The 72 underpromotion logits of each position: the logit of the pawn move plus the piece's
+# score on the target square (net.Net.forward). under is [positions * 64] rows of `stride` that
+# start with the 3 scores. One block per position.
+@kernel
+fn underpromotions(policy: *f32, under: *f32, stride: int)
+    let p = block_index().x as i64
+    let c = thread_index().x
+    if c >= 72: return
+    let row = policy + p * Classes
+    let to = under_to(c)
+    row[4096 + c] = row[under_from(c) * 64 + to] + under[(p * 64 + to) * stride + c / 24]
+
+# The backward pass of underpromotions, one thread per position: each underpromotion's gradient
+# goes to its pawn move's logit (added into dpolicy) and to the piece's score on the target
+# square (du, [positions * 64] rows of `stride` that start with the 3 scores, set here).
+@kernel
+fn underpromotions_back(count: int, dpolicy: *f32, du: *f32, stride: int)
+    let p = block_index().x * block_size().x + thread_index().x
+    if p >= count: return
+    let row = dpolicy + p as i64 * Classes
+    let u = du + p as i64 * 64 * stride
+    for i in 0..64
+        for piece in 0..3
+            u[i * stride + piece] = 0.0
+    for c in 0..72
+        let g = row[4096 + c]
+        let to = under_to(c)
+        row[under_from(c) * 64 + to] += g
+        u[to * stride + c / 24] += g
+
+# The three highest logits seen, and their classes. A later class must be higher to displace an
+# earlier one.
+struct Top3
+    v0: f32 = -3.0e38
+    v1: f32 = -3.0e38
+    v2: f32 = -3.0e38
+    c0: int = -1
+    c1: int = -1
+    c2: int = -1
+
+    fn see(cls: int, v: f32)
+        if v > v0
+            v2 = v1
+            c2 = c1
+            v1 = v0
+            c1 = c0
+            v0 = v
+            c0 = cls
+        elif v > v1
+            v2 = v1
+            c2 = c1
+            v1 = v
+            c1 = cls
+        elif v > v2
+            v2 = v
+            c2 = cls
+
+# The sum of exp(logit - most) over the legal classes of r.
+fn legal_total(r: *u8, row: *f32, most: f32) -> f32
+    var total: f32 = 0.0
+    var moves = LegalMoves(r: r)
+    var cls = moves.next()
+    while cls >= 0
+        total += exp(row[cls] - most)
+        cls = moves.next()
+    return total
+
+# One thread per position: the legal class with the highest logit, whether the move played is
+# among the three highest, and its cross-entropy over the legal moves, as train.py's evaluate()
+# scores the net.
+@kernel
+fn score_moves(count: int, records: *u8, policy: *f32, best: *i32, top3: *u8, loss: *f32)
+    let p = block_index().x * block_size().x + thread_index().x
+    if p >= count: return
+    let r = records + p as i64 * Record
+    let row = policy + p as i64 * Classes
+    var top: Top3
+    var moves = LegalMoves(r: r)
+    var cls = moves.next()
+    while cls >= 0
+        top.see(cls, row[cls])
+        cls = moves.next()
+    let target = rec_u16(r, AtTarget)
+    best[p] = top.c0
+    top3[p] = target == top.c0 or target == top.c1 or target == top.c2 ? 1 : 0
+    loss[p] = log(legal_total(r, row, top.v0)) + top.v0 - row[target]
+
+# The policy loss, one thread per position: the cross-entropy of the move played over the legal
+# moves, and its gradient times scale on each legal logit. dpolicy must be zero beforehand, since
+# only the legal classes are written.
+@kernel
+fn policy_loss(count: int, records: *u8, policy: *f32, scale: f32, dpolicy: *f32, loss: *f32)
+    let p = block_index().x * block_size().x + thread_index().x
+    if p >= count: return
+    let r = records + p as i64 * Record
+    let row = policy + p as i64 * Classes
+    var most: f32 = -3.0e38
+    var moves = LegalMoves(r: r)
+    var cls = moves.next()
+    while cls >= 0
+        most = max(most, row[cls])
+        cls = moves.next()
+    let total = legal_total(r, row, most)
+    let target = rec_u16(r, AtTarget)
+    loss[p] = log(total) + most - row[target]
+    let grad = dpolicy + p as i64 * Classes
+    moves = LegalMoves(r: r)
+    cls = moves.next()
+    while cls >= 0
+        grad[cls] = scale * (exp(row[cls] - most) / total - (cls == target ? 1.0 : 0.0))
+        cls = moves.next()
+
+# The cross-entropy of class target over n logits, and its gradient times scale in grad.
+fn cross_entropy(logits: *f32, n: int, target: int, scale: f32, grad: *f32) -> f32
+    var most: f32 = -3.0e38
+    for i in 0..n
+        most = max(most, logits[i])
+    var total: f32 = 0.0
+    for i in 0..n
+        total += exp(logits[i] - most)
+    for i in 0..n
+        grad[i] = scale * (exp(logits[i] - most) / total - (i == target ? 1.0 : 0.0))
+    return log(total) + most - logits[target]
+
+# The think-time bin of a move (net.time_bin): 0 for under a second, then quarter octaves from
+# 1 s, up to bin 31 (about 3 minutes and over).
+fn time_bin(seconds: int) -> int
+    if seconds < 1: return 0
+    return min(1 + floor(log2(seconds as f32) * 4.0) as int, TimeBins - 1)
+
+# The value loss, one thread per position: the cross-entropy of the game's result over the loss,
+# draw and win logits, for positions whose result is known; scale is the loss weight over their
+# count. Other positions get a zero gradient and loss.
+@kernel
+fn value_loss(count: int, records: *u8, value: *f32, scale: f32, dvalue: *f32, loss: *f32)
+    let p = block_index().x * block_size().x + thread_index().x
+    if p >= count: return
+    let result = records[p as i64 * Record + AtResult] as int
+    let grad = dvalue + p * 3
+    if result >= 3
+        for i in 0..3
+            grad[i] = 0.0
+        loss[p] = 0.0
+        return
+    loss[p] = cross_entropy(value + p * 3, 3, result, scale, grad)
+
+# The time loss, one thread per position: the cross-entropy of the think-time bin, for positions
+# not given their think time whose think time is known, from the second ply on; scale is the loss
+# weight over their count.
+@kernel
+fn time_loss(count: int, records: *u8, known: *u8, time: *f32, scale: f32, dtime: *f32, loss: *f32)
+    let p = block_index().x * block_size().x + thread_index().x
+    if p >= count: return
+    let r = records + p as i64 * Record
+    let think = rec_u16(r, AtThink)
+    let grad = dtime + p * TimeBins
+    if known[p] != 0 or think == NoClock or rec_u16(r, AtPly) < 2
+        for i in 0..TimeBins
+            grad[i] = 0.0
+        loss[p] = 0.0
+        return
+    loss[p] = cross_entropy(time + p * TimeBins, TimeBins, time_bin(think), scale, grad)
+
+# Whether a position counts toward the time loss (time_loss).
+fn timed(r: *u8, known: bool) -> bool
+    return not known and rec_u16(r, AtThink) != NoClock and rec_u16(r, AtPly) >= 2
+
+# The salience loss, one thread per square of each position: binary cross-entropy of the square's
+# logit against whether the move played touches it, and its gradient times scale.
+@kernel
+fn salience_loss(count: int, records: *u8, salience: *f32, scale: f32, dsal: *f32, loss: *f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i >= count * 64: return
+    let p = i / 64
+    let sq = i % 64
+    let t: f32 = (rec_u64(records + p as i64 * Record, AtSalience) >> sq) & 1 != 0 ? 1.0 : 0.0
+    let s = salience[i]
+    loss[i] = max(s, 0.0) - s * t + log(1.0 + exp(-abs(s)))
+    dsal[i] = scale * (1.0 / (1.0 + exp(-s)) - t)
+
+fn run_underpromotions(count: int, policy: DeviceMemory, under: DeviceMemory, stride: int = 3)
+    launch(&kernels, count, 96, 0, gpu_args(underpromotions, policy, under, stride))
+
+fn run_underpromotions_back(count: int, dpolicy: DeviceMemory, du: DeviceMemory, stride: int = 3)
+    launch(&kernels, blocks_for(count, 128), 128, 0, gpu_args(underpromotions_back, count, dpolicy, du, stride))
+
+fn run_score_moves(count: int, records: DeviceMemory, policy: DeviceMemory, best: DeviceMemory, top3: DeviceMemory, loss: DeviceMemory)
+    launch(&kernels, blocks_for(count, 128), 128, 0, gpu_args(score_moves, count, records, policy, best, top3, loss))

@@ -1,0 +1,99 @@
+# AdamW with gradient-norm clipping (train.py: clip_grad_norm_(1.0), then fused AdamW).
+
+use cuda/driver
+use model
+use kernels/gemm
+use kernels/layers
+
+# Adds the sum of squares of n values to total, which must be zero beforehand: each thread sums
+# a stride of x, each warp combines its threads', and each warp adds its sum with an f64 atomic.
+@kernel
+fn square_sum(n: int, x: *f32, total: *f64)
+    let stride = grid_size().x * block_size().x
+    var i = block_index().x * block_size().x + thread_index().x
+    var s: f32 = 0.0
+    while i < n
+        s = fma(x[i], x[i], s)
+        i += stride
+    s = warp_sum(s)
+    if lane_index() == 0: atomic_add(total, s as f64)
+
+struct AdamW
+    beta1: f32 = 0.9
+    beta2: f32 = 0.95
+    eps: f32 = 0.00000001
+    weight_decay: f32 = 0.01
+    max_norm: f32 = 1.0
+
+# The factor clip_grad_norm_ scales the gradient by: min(1, max_norm / (norm + 1e-6)), with norm
+# the square root of the sum of squares norm2.
+fn clip_factor(norm2: f64, max_norm: f32) -> f32
+    let norm = sqrt(norm2) as f32
+    return min(max_norm / (norm + 0.000001), 1.0)
+
+# One parameter's AdamW update, in PyTorch's order of operations (its fused AdamW): the parameter,
+# first and second moment after the step, from the gradient g already clipped. bias1 and bias2
+# are 1 - beta1^t and 1 - beta2^t for step t (from 1). The GPU and the CPU compute the same bits.
+fn adamw_update(param: f32, g: f32, m: f32, v: f32, decay: bool, lr: f32, s: AdamW, bias1: f32, bias2: f32) -> (f32, f32, f32)
+    var p = param
+    if decay: p = p - lr * s.weight_decay * p
+    let mi = s.beta1 * m + (1.0 - s.beta1) * g
+    let vi = s.beta2 * v + (1.0 - s.beta2) * g * g
+    let step_size = lr / bias1
+    let denom = sqrt(vi) / sqrt(bias2) + s.eps
+    return p - step_size * mi / denom, mi, vi
+
+# One AdamW step on n parameters (adamw_update), the gradient first scaled by clip_factor.
+# decay[i] is 1 for parameters in the weight-decay group.
+@kernel
+fn adamw_step(n: int, params: *f32, grads: *f32, m: *f32, v: *f32, decay: *u8, lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32, bias1: f32, bias2: f32, norm2: *f64, max_norm: f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i >= n: return
+    let s = AdamW(beta1: beta1, beta2: beta2, eps: eps, weight_decay: weight_decay, max_norm: max_norm)
+    let g = grads[i] * clip_factor(norm2[0], max_norm)
+    let (p, mi, vi) = adamw_update(params[i], g, m[i], v[i], decay[i] != 0, lr, s, bias1, bias2)
+    params[i] = p
+    m[i] = mi
+    v[i] = vi
+
+# The optimizer's state on the GPU.
+struct Optimizer
+    settings: AdamW
+    m: DeviceMemory
+    v: DeviceMemory
+    decay: DeviceMemory         # [n] u8
+    norm2: DeviceMemory         # one f64
+    steps: i64                  # steps taken
+
+# A new optimizer for the parameters of layout l, with zero moments; settings.weight_decay
+# applies to the tensors of the weight-decay group.
+fn new_optimizer(l: *Layout, settings: AdamW) -> Optimizer
+    var o: Optimizer
+    o.settings = settings
+    o.m = device_alloc(l.total * 4)
+    o.v = device_alloc(l.total * 4)
+    o.norm2 = device_alloc(8)
+    let decay = alloc[u8](l.total)
+    for t in 0..l.params.len
+        let p = &l.params[t]
+        for i in p.at..p.at + p.count
+            decay[i] = p.decay ? 1 : 0
+    o.decay = device_alloc(l.total)
+    upload(o.decay, decay, l.total)
+    free(decay)
+    return o
+
+# 1 - beta1^t and 1 - beta2^t for step t.
+fn bias_corrections(s: AdamW, t: i64) -> (f32, f32)
+    return (1.0 - pow(s.beta1 as f64, t as f64)) as f32, (1.0 - pow(s.beta2 as f64, t as f64)) as f32
+
+# Clips the gradient and takes one step with learning rate lr, leaving the gradient's squared
+# norm in o.norm2.
+fn optimizer_step(o: *Optimizer, params: DeviceMemory, grads: DeviceMemory, n: i64, lr: f32)
+    device_zero(o.norm2)
+    launch(&kernels, 1024, 256, 0, gpu_args(square_sum, n as int, grads, o.norm2))
+    o.steps += 1
+    let s = o.settings
+    let (bias1, bias2) = bias_corrections(s, o.steps)
+    launch(&kernels, blocks_for(n, 256), 256, 0, gpu_args(adamw_step, n as int, params, grads, o.m, o.v, o.decay,
+        lr, s.beta1, s.beta2, s.eps, s.weight_decay, bias1, bias2, o.norm2, s.max_norm))

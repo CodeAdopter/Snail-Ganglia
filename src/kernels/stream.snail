@@ -1,0 +1,268 @@
+# The residual stream in the bf16 pass (half.snail): the stream itself stays f32, and what
+# branches off it and comes back to it is bf16. Each kernel here does in one pass over the stream
+# what joins two of the net's layers: a residual add with the norm that follows it, and the
+# backward pass of a norm with that of the gate before it.
+
+use cuda/driver
+use kernels/gemm
+use kernels/layers
+
+# A lane of a warp takes 8 columns in a row of every 256, so a warp reads 256 columns with each
+# 16-byte load its lanes make, 2 for f32 and 1 for bf16: a load is a round trip to GPU memory
+# whatever its size, and these kernels do little else. The lane keeps its values of the row in
+# registers. d is a multiple of 8 and at most 256 times StreamChunks.
+const StreamChunks = 2
+
+# Eight f32 from p, a multiple of 32 bytes, and back.
+@inline
+fn load8(p: *f32, out: *[8]f32)
+    f32x4.load_aligned(p).store(&out[0])
+    f32x4.load_aligned(p + 4).store(&out[4])
+
+@inline
+fn store8(p: *f32, v: *[8]f32)
+    f32x4.load(&v[0]).store_aligned(p)
+    f32x4.load(&v[4]).store_aligned(p + 4)
+
+# Eight bf16 from p, a multiple of 16 bytes, as f32, and back.
+@inline
+fn load8_halves(p: *bf16, out: *[8]f32)
+    var w: [4]u32
+    u32x4.load_aligned(p as *u32).store(&w[0])
+    @unroll
+    for i in 0..4
+        out[2 * i] = bf16.from_bits((w[i] & 0xFFFF) as u16) as f32
+        out[2 * i + 1] = bf16.from_bits((w[i] >> 16) as u16) as f32
+
+@inline
+fn store8_halves(p: *bf16, v: *[8]f32)
+    var w: [4]u32
+    @unroll
+    for i in 0..4
+        w[i] = (v[2 * i] as bf16).bits as u32 | ((v[2 * i + 1] as bf16).bits as u32) << 16
+    u32x4.load(&w[0]).store_aligned(p as *u32)
+
+# out = x + gate * add, then y = norm(out) (1 + scale) + shift as bf16, for rows of d, one warp per
+# row. add is [rows][d] bf16, or null for out = x (then out is not written). Each position's 64
+# rows share a row of gate, and one of mod, whose columns scale_at and shift_at start scale and
+# shift; both have rows of mod_row.
+@kernel
+fn resid_norm(rows: int, d: int, x: *f32, add: *bf16, gate: *f32, out: *f32, mod: *f32, mod_row: int, scale_at: int, shift_at: int, y: *bf16)
+    let row = warp_row()
+    if row >= rows: return
+    let xr = x + row as i64 * d
+    let xo = out + row as i64 * d
+    let ar = add + row as i64 * d
+    let gr = gate + (row / 64) as i64 * mod_row
+    let lane = lane_index()
+    var v: [StreamChunks][8]f32
+    var sum: f32 = 0.0
+    @unroll
+    for q in 0..StreamChunks
+        let c = 8 * (lane + 32 * q)
+        if c < d
+            load8(xr + c, &v[q])
+            if add != null
+                var a: [8]f32
+                var g: [8]f32
+                load8_halves(ar + c, &a)
+                load8(gr + c, &g)
+                @unroll
+                for i in 0..8
+                    v[q][i] += g[i] * a[i]
+                store8(xo + c, &v[q])
+            @unroll
+            for i in 0..8
+                sum += v[q][i]
+    let mean = warp_sum(sum) / d as f32
+    var sq: f32 = 0.0
+    @unroll
+    for q in 0..StreamChunks
+        if 8 * (lane + 32 * q) < d
+            @unroll
+            for i in 0..8
+                v[q][i] -= mean
+                sq += v[q][i] * v[q][i]
+    let inv = rsqrt(warp_sum(sq) / d as f32 + NormEps)
+    let mr = mod + (row / 64) as i64 * mod_row
+    let yr = y + row as i64 * d
+    @unroll
+    for q in 0..StreamChunks
+        let c = 8 * (lane + 32 * q)
+        if c < d
+            var scale: [8]f32
+            var shift: [8]f32
+            load8(mr + scale_at + c, &scale)
+            load8(mr + shift_at + c, &shift)
+            @unroll
+            for i in 0..8
+                v[q][i] = v[q][i] * inv * (1.0 + scale[i]) + shift[i]
+            store8_halves(yr + c, &v[q])
+
+# out = x + gate * add for rows of d, add bf16 and the gate a row of mod_row per position.
+@kernel
+fn gated_add(rows: int, d: int, x: *f32, add: *bf16, gate: *f32, mod_row: int, out: *f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i >= rows * d: return
+    let row = i / d
+    let j = i - row * d
+    out[i] = x[i] + gate[(row / 64) as i64 * mod_row + j] * (add[i] as f32)
+
+# The backward pass where a norm reads the stream and a gated branch joins it, one position per
+# block of 256 threads, each warp taking 8 of the position's 64 rows.
+#
+# With dy not null: the stream's value is x, plus gate_in * add_in when add_in is not null, and y
+# was norm(that) (1 + scale) + shift. Adds the gradient through the norm to dx (as
+# ada_norm_back does), or sets dx to it when fresh is set, and writes the sums over the
+# position's rows of dy xhat and of dy to dscale and dshift.
+#
+# With add_out not null: the stream had joined as base + gate_out * add_out. Writes
+# dadd = dx * gate_out as bf16, the sums over the position's rows of dx * add_out to dgate, and
+# those of dadd to sums [positions][d] unless it is null. add_in, when given, is add_out.
+#
+# gate_in, scale, gate_out, dscale, dshift and dgate each point at their first column in rows of
+# mod_row. Shared memory: 8 warps x 4 sums x d floats.
+@kernel
+fn norm_back_gate(d: int, mod_row: int, x: *f32, add_in: *bf16, gate_in: *f32, dy: *bf16, scale: *f32, dx: *f32, fresh: bool, add_out: *bf16, gate_out: *f32, dadd: *bf16, dscale: *f32, dshift: *f32, dgate: *f32, sums: *f32)
+    let p = block_index().x as i64
+    let warp = thread_index().x / 32
+    let lane = lane_index()
+    let all = shared_memory[f32]()
+    let part = all + warp * 4 * d
+    var j = lane
+    while j < d
+        part[j] = 0.0
+        part[d + j] = 0.0
+        part[2 * d + j] = 0.0
+        part[3 * d + j] = 0.0
+        j += 32
+    let gin = gate_in + p * mod_row
+    let sc = scale + p * mod_row
+    let gout = gate_out + p * mod_row
+    for r in 0..8
+        let at = (p * 64 + warp + 8 * r) * d
+        # The lane's values of the row: the stream, then its normed value; dy, then dy (1 + scale);
+        # dx; add_out.
+        var v: [StreamChunks][8]f32
+        var gy: [StreamChunks][8]f32
+        var gs: [StreamChunks][8]f32
+        var dv: [StreamChunks][8]f32
+        var av: [StreamChunks][8]f32
+        @unroll
+        for q in 0..StreamChunks
+            let c = 8 * (lane + 32 * q)
+            if c < d
+                if dy != null
+                    load8(x + (at + c), &v[q])
+                    load8_halves(dy + (at + c), &gy[q])
+                if not fresh: load8(dx + (at + c), &dv[q])
+                if add_out != null: load8_halves(add_out + (at + c), &av[q])
+        var inv: f32 = 0.0
+        var m1: f32 = 0.0
+        var m2: f32 = 0.0
+        if dy != null
+            var sum: f32 = 0.0
+            @unroll
+            for q in 0..StreamChunks
+                let c = 8 * (lane + 32 * q)
+                if c < d
+                    if add_in != null
+                        var g: [8]f32
+                        load8(gin + c, &g)
+                        @unroll
+                        for i in 0..8
+                            v[q][i] += g[i] * av[q][i]
+                    @unroll
+                    for i in 0..8
+                        sum += v[q][i]
+            let mean = warp_sum(sum) / d as f32
+            var sq: f32 = 0.0
+            @unroll
+            for q in 0..StreamChunks
+                if 8 * (lane + 32 * q) < d
+                    @unroll
+                    for i in 0..8
+                        v[q][i] -= mean
+                        sq += v[q][i] * v[q][i]
+            inv = rsqrt(warp_sum(sq) / d as f32 + NormEps)
+            @unroll
+            for q in 0..StreamChunks
+                let c = 8 * (lane + 32 * q)
+                if c < d
+                    var s: [8]f32
+                    load8(sc + c, &s)
+                    @unroll
+                    for i in 0..8
+                        v[q][i] *= inv
+                        gs[q][i] = gy[q][i] * (1.0 + s[i])
+                        m1 += gs[q][i]
+                        m2 += gs[q][i] * v[q][i]
+            m1 = warp_sum(m1) / d as f32
+            m2 = warp_sum(m2) / d as f32
+        @unroll
+        for q in 0..StreamChunks
+            let c = 8 * (lane + 32 * q)
+            if c < d
+                var sums8: [4][8]f32
+                @unroll
+                for k in 0..4
+                    load8(part + (k * d + c), &sums8[k])
+                if dy != null
+                    @unroll
+                    for i in 0..8
+                        dv[q][i] += (gs[q][i] - m1 - v[q][i] * m2) * inv
+                        sums8[0][i] += gy[q][i] * v[q][i]
+                        sums8[1][i] += gy[q][i]
+                    store8(dx + (at + c), &dv[q])
+                if add_out != null
+                    var g: [8]f32
+                    var da: [8]f32
+                    load8(gout + c, &g)
+                    @unroll
+                    for i in 0..8
+                        da[i] = dv[q][i] * g[i]
+                        sums8[2][i] += dv[q][i] * av[q][i]
+                        sums8[3][i] += da[i]
+                    store8_halves(dadd + (at + c), &da)
+                @unroll
+                for k in 0..4
+                    store8(part + (k * d + c), &sums8[k])
+    sync_threads()
+    j = thread_index().x
+    while j < d
+        var s0: f32 = 0.0
+        var s1: f32 = 0.0
+        var s2: f32 = 0.0
+        var s3: f32 = 0.0
+        for w in 0..8
+            let from = all + w * 4 * d + j
+            s0 += from[0]
+            s1 += from[d]
+            s2 += from[2 * d]
+            s3 += from[3 * d]
+        if dy != null
+            dscale[p * mod_row + j] = s0
+            dshift[p * mod_row + j] = s1
+        if add_out != null
+            dgate[p * mod_row + j] = s2
+            if sums != null: sums[p * d + j] = s3
+        j += 256
+
+# The parameters as bf16, each tensor starting at a multiple of 8: parameter i goes to
+# half[i + shift[i]] (model.snail's at16).
+@kernel
+fn halve_params(n: i64, params: *f32, shift: *u16, half: *bf16)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i < n: half[i + shift[i] as i64] = params[i] as bf16
+
+fn run_resid_norm(rows: int, d: int, x: DeviceMemory, add: DeviceMemory, gate: DeviceMemory, out: DeviceMemory, mod: DeviceMemory, mod_row: int, scale_at: int, shift_at: int, y: DeviceMemory)
+    launch(&kernels, blocks_for(rows, 8), 256, 0, gpu_args(resid_norm, rows, d, x, add, gate, out, mod, mod_row, scale_at, shift_at, y))
+
+fn run_gated_add(rows: int, d: int, x: DeviceMemory, add: DeviceMemory, gate: DeviceMemory, mod_row: int, out: DeviceMemory)
+    launch(&kernels, blocks_for(rows as i64 * d, 256), 256, 0, gpu_args(gated_add, rows, d, x, add, gate, mod_row, out))
+
+fn norm_back_gate_shared(d: int) -> int
+    return 8 * 4 * d * 4
+
+fn run_norm_back_gate(positions: int, d: int, mod_row: int, x: DeviceMemory, add_in: DeviceMemory, gate_in: DeviceMemory, dy: DeviceMemory, scale: DeviceMemory, dx: DeviceMemory, fresh: bool, add_out: DeviceMemory, gate_out: DeviceMemory, dadd: DeviceMemory, dscale: DeviceMemory, dshift: DeviceMemory, dgate: DeviceMemory, sums: DeviceMemory)
+    launch(&kernels, positions, 256, norm_back_gate_shared(d), gpu_args(norm_back_gate, d, mod_row, x, add_in, gate_in, dy, scale, dx, fresh, add_out, gate_out, dadd, dscale, dshift, dgate, sums))

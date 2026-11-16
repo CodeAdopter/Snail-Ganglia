@@ -1,0 +1,487 @@
+# The net's sizes and where each of its tensors lives in one buffer of floats.
+#
+# The tensors are those of the Python net (net.Net in the frozen Python project), in the engine's
+# order (its export.py), followed by the salience head, which only training uses. Each tensor
+# keeps PyTorch's layout: a Linear's weight is [out][in], a knot table [groups][knots][dc].
+
+const Inputs = 9 * 14 + 1 + 8   # per square: 9 boards x 14 piece codes, en passant, 8 position inputs
+const Classes = 4096 + 72       # from * 64 + to, then the underpromotions
+const TimeBins = 32
+const NoClock = 0xFFFF
+# Smolgen: each square compressed to 16 numbers, a 128-wide hidden layer, a 128-number code per
+# head, and one 128 -> 64 x 64 projection shared by every layer.
+const SmolCompress = 16
+const SmolHidden = 128
+const SmolCode = 128
+const HeadTokens = 32           # the value and time heads' numbers per square
+const HeadHidden = 128
+
+struct Config
+    d: int
+    layers: int
+    heads: int
+    ffn: int
+    dc: int                     # the condition vector
+    dp: int                     # the policy's query and key size
+    smolgen: bool
+    bullet_tables: bool = false # bullet has rating and clock tables of its own (kernels/inputs.snail's speed_group)
+
+# One tensor of the layout.
+struct Param
+    name: str
+    at: i64                     # offset in floats
+    at16: i64                   # offset in the bf16 copy of the parameters, a multiple of 8
+    count: i64
+    decay: bool                 # in AdamW's weight-decay group: 2 or more dimensions, not a knot table or pos
+    rows: i64                   # a Linear's weight has this many rows [out], each of count / rows; 0 for any other
+                                # tensor, and for the weights a quantized net keeps as half floats (exact_weight)
+
+struct BlockLayout
+    ada_w: i64
+    ada_b: i64
+    qkv_w: i64
+    qkv_b: i64
+    out_w: i64
+    out_b: i64
+    ff1_w: i64
+    ff1_b: i64
+    ff2_w: i64
+    ff2_b: i64
+    rel: i64
+    sg_compress: i64
+    sg_w0: i64
+    sg_b0: i64
+    sg_ln_w: i64
+    sg_ln_b: i64
+    sg_w3: i64
+    sg_b3: i64
+    sg_norm_w: i64
+    sg_norm_b: i64
+
+# Linears that read the same input, run as one product in the bf16 pass (half.snail): their
+# weights stacked as [n][k] bf16 in the net's packed copy, a row of k per output, and their biases
+# as [n] f32. A row's k and the group's n are padded with zeros to multiples of 8, as the products
+# need them (kernels/mm.snail).
+struct LinearGroup
+    k: int
+    n: int
+    at: i64                     # where its weights start in the packed copy, and their sources in packed_from
+    bias_at: i64                # where its biases start in the packed biases, and their sources in bias_from
+
+# The columns of the heads' group (Layout.heads_group): the policy's queries and keys, the
+# underpromotions, the value and time heads' tokens, and salience.
+struct HeadColumns
+    q: int
+    k: int
+    under: int
+    vtok: int
+    ttok: int
+    sal: int
+
+struct Layout
+    cfg: Config
+    params: [..]Param
+    total: i64
+    total16: i64                # the size of the bf16 copy, with every tensor at a multiple of 8
+    # The groups, and for each value of their packed weights and biases the offset of the parameter
+    # it copies, -1 for padding.
+    packed_from: [..]i32
+    bias_from: [..]i32
+    ada_group: LinearGroup      # every block's ada, then final_ada: the condition to 6 d per block and 2 d
+    heads_group: LinearGroup    # pq, pk, under, vtok, ttok and sal, on the final tokens
+    input_group: LinearGroup    # inp, on the squares' features
+    qkv_groups: [..]LinearGroup # with smolgen, a block's qkv and smolgen.compress
+    head_columns: HeadColumns
+    inp_w: i64
+    inp_b: i64
+    pos: i64
+    own_rating: i64
+    opp_rating: i64
+    own_clock: i64
+    opp_clock: i64
+    think: i64
+    opp_think: i64
+    ply: i64
+    think_unknown: i64
+    increment: i64
+    berserk: i64
+    kind: i64
+    speed: i64
+    mlp0_w: i64
+    mlp0_b: i64
+    mlp2_w: i64
+    mlp2_b: i64
+    blocks: [..]BlockLayout
+    sg_shared: i64
+    final_w: i64
+    final_b: i64
+    pq_w: i64
+    pq_b: i64
+    pk_w: i64
+    pk_b: i64
+    under_w: i64
+    under_b: i64
+    vtok_w: i64
+    vtok_b: i64
+    value0_w: i64
+    value0_b: i64
+    value2_w: i64
+    value2_b: i64
+    ttok_w: i64
+    ttok_b: i64
+    time0_w: i64
+    time0_b: i64
+    time2_w: i64
+    time2_b: i64
+    sal_w: i64
+    sal_b: i64
+
+    # Appends a tensor of count floats and returns its offset. How each tensor starts is
+    # init_params' business; the names below say which kind of tensor it is.
+    fn add(name: str, count: i64, decay: bool, rows: i64 = 0) -> i64
+        let at = total
+        let at16 = (total16 + 7) / 8 * 8
+        params.push(Param(name: name, at: at, at16: at16, count: count, decay: decay, rows: rows))
+        total += count
+        total16 = at16 + count
+        return at
+
+    # A Linear's weight [n_out][n_in] and its bias.
+    fn weight(name: str, n_out: i64, n_in: i64) -> i64
+        return add(name, n_out * n_in, true, n_out)
+
+    # A Linear's weight that a quantized net keeps as half floats (quantized.snail): those of the
+    # value and time heads. Their logits come out of sums over 2,048 numbers that mostly cancel,
+    # and as 8-bit integers these weights alone moved a result probability by up to 0.03 and a
+    # think-time bin's by up to 0.06, while being 2% to 6% of a net.
+    fn exact_weight(name: str, n_out: i64, n_in: i64) -> i64
+        return add(name, n_out * n_in, true)
+
+    # A Linear's weight that starts at zero.
+    fn zero_weight(name: str, n_out: i64, n_in: i64) -> i64
+        return add(name, n_out * n_in, true, n_out)
+
+    fn bias(name: str, n_out: i64, n_in: i64) -> i64
+        return add(name, n_out, false)
+
+    # A tensor that starts at zero, a layer norm's weight, which starts at one, and a table or an
+    # embedding, which starts normal with standard deviation std.
+    fn zeros(name: str, count: i64, decay: bool) -> i64
+        return add(name, count, decay)
+
+    fn ones(name: str, count: i64) -> i64
+        return add(name, count, false)
+
+    fn normal(name: str, count: i64, std: f32, decay: bool) -> i64
+        return add(name, count, decay)
+
+    # A new group for inputs of k.
+    fn group(k: int) -> LinearGroup
+        return LinearGroup(k: (k + 7) / 8 * 8, n: 0, at: packed_from.len, bias_at: bias_from.len)
+
+    # Adds a Linear with weight [n_out][k_in] at w and bias at b (-1 for none) to g, and returns
+    # its first column.
+    fn member(g: *LinearGroup, w: i64, b: i64, n_out: int, k_in: int) -> int
+        let first = g.n
+        for r in 0..n_out
+            for c in 0..g.k
+                packed_from.push(c < k_in ? (w + r as i64 * k_in + c) as i32 : -1)
+            bias_from.push(b >= 0 ? (b + r) as i32 : -1)
+        g.n += n_out
+        return first
+
+    # Pads g to a multiple of 8 outputs.
+    fn close(g: *LinearGroup)
+        while g.n % 8 != 0
+            for c in 0..g.k
+                packed_from.push(-1)
+            bias_from.push(-1)
+            g.n += 1
+
+    # Where the tensor that starts at float offset at starts in the bf16 copy.
+    fn half_at(at: i64) -> i64
+        var lo: i64 = 0
+        var hi = params.len - 1
+        while lo < hi
+            let mid = (lo + hi + 1) / 2
+            if params[mid].at <= at: lo = mid
+            else: hi = mid - 1
+        if params[lo].at != at: panic("no tensor starts at this offset")
+        return params[lo].at16
+
+# A copy of text that outlives the buffer it was formatted into.
+fn kept(text: str) -> str
+    let p = alloc[u8](text.len)
+    copy(p, text.ptr, text.len)
+    return p[0..text.len] as str
+
+fn block_name(layer: int, name: str) -> str
+    var buffer: [96]u8
+    return kept(format(&buffer, "blocks.{layer}.{name}"))
+
+fn layout_of(cfg: Config) -> *Layout
+    let l = new Layout
+    l.cfg = cfg
+    let d = cfg.d as i64
+    let dc = cfg.dc as i64
+    let dp = cfg.dp as i64
+    let ffn = cfg.ffn as i64
+    let heads = cfg.heads as i64
+    let flat = 64 * HeadTokens
+    l.inp_w = l.weight("inp.weight", d, Inputs)
+    l.inp_b = l.bias("inp.bias", d, Inputs)
+    l.pos = l.normal("pos", 64 * d, 0.02, false)
+    l.own_rating = l.normal("cond.own_rating.table", 4 * 23 * dc, 0.02, false)
+    l.opp_rating = l.normal("cond.opp_rating.table", 4 * 23 * dc, 0.02, false)
+    l.own_clock = l.normal("cond.own_clock.table", 4 * 12 * dc, 0.02, false)
+    l.opp_clock = l.normal("cond.opp_clock.table", 4 * 12 * dc, 0.02, false)
+    l.think = l.normal("cond.think.table", 12 * dc, 0.02, false)
+    l.opp_think = l.normal("cond.opp_think.table", 12 * dc, 0.02, false)
+    l.ply = l.normal("cond.ply.table", 21 * dc, 0.02, false)
+    l.think_unknown = l.zeros("cond.think_unknown", dc, false)
+    l.increment = l.normal("cond.increment.weight", 10 * dc, 1.0, true)
+    l.berserk = l.normal("cond.berserk.weight", 4 * dc, 1.0, true)
+    l.kind = l.normal("cond.kind.weight", 4 * dc, 1.0, true)
+    l.speed = l.normal("cond.speed.weight", 6 * dc, 1.0, true)
+    l.mlp0_w = l.weight("cond.mlp.0.weight", dc, dc)
+    l.mlp0_b = l.bias("cond.mlp.0.bias", dc, dc)
+    l.mlp2_w = l.weight("cond.mlp.2.weight", dc, dc)
+    l.mlp2_b = l.bias("cond.mlp.2.bias", dc, dc)
+    for i in 0..cfg.layers
+        let b = l.blocks.add()
+        # The condition's scales, shifts and gates start at zero, so each block starts as the
+        # identity (net.Block).
+        b.ada_w = l.zero_weight(block_name(i, "ada.weight"), 6 * d, dc)
+        b.ada_b = l.zeros(block_name(i, "ada.bias"), 6 * d, false)
+        b.qkv_w = l.weight(block_name(i, "qkv.weight"), 3 * d, d)
+        b.qkv_b = l.bias(block_name(i, "qkv.bias"), 3 * d, d)
+        b.out_w = l.weight(block_name(i, "out.weight"), d, d)
+        b.out_b = l.bias(block_name(i, "out.bias"), d, d)
+        b.ff1_w = l.weight(block_name(i, "ff1.weight"), ffn, d)
+        b.ff1_b = l.bias(block_name(i, "ff1.bias"), ffn, d)
+        b.ff2_w = l.weight(block_name(i, "ff2.weight"), d, ffn)
+        b.ff2_b = l.bias(block_name(i, "ff2.bias"), d, ffn)
+        b.rel = l.zeros(block_name(i, "rel"), heads * 225, true)
+        if cfg.smolgen
+            b.sg_compress = l.weight(block_name(i, "smolgen.compress.weight"), SmolCompress, d)
+            b.sg_w0 = l.weight(block_name(i, "smolgen.mlp.0.weight"), SmolHidden, 64 * SmolCompress)
+            b.sg_b0 = l.bias(block_name(i, "smolgen.mlp.0.bias"), SmolHidden, 64 * SmolCompress)
+            b.sg_ln_w = l.ones(block_name(i, "smolgen.mlp.2.weight"), SmolHidden)
+            b.sg_ln_b = l.zeros(block_name(i, "smolgen.mlp.2.bias"), SmolHidden, false)
+            b.sg_w3 = l.weight(block_name(i, "smolgen.mlp.3.weight"), heads * SmolCode, SmolHidden)
+            b.sg_b3 = l.bias(block_name(i, "smolgen.mlp.3.bias"), heads * SmolCode, SmolHidden)
+            b.sg_norm_w = l.ones(block_name(i, "smolgen.norm.weight"), SmolCode)
+            b.sg_norm_b = l.zeros(block_name(i, "smolgen.norm.bias"), SmolCode, false)
+    # Smolgen's shared projection starts at zero, so the net begins with the relative biases alone.
+    if cfg.smolgen: l.sg_shared = l.zero_weight("smolgen_shared.weight", 4096, SmolCode)
+    l.final_w = l.zero_weight("final_ada.weight", 2 * d, dc)
+    l.final_b = l.zeros("final_ada.bias", 2 * d, false)
+    l.pq_w = l.weight("pq.weight", dp, d)
+    l.pq_b = l.bias("pq.bias", dp, d)
+    l.pk_w = l.weight("pk.weight", dp, d)
+    l.pk_b = l.bias("pk.bias", dp, d)
+    l.under_w = l.weight("under.weight", 3, d)
+    l.under_b = l.bias("under.bias", 3, d)
+    l.vtok_w = l.exact_weight("vtok.weight", HeadTokens, d)
+    l.vtok_b = l.bias("vtok.bias", HeadTokens, d)
+    l.value0_w = l.exact_weight("value.0.weight", HeadHidden, flat)
+    l.value0_b = l.bias("value.0.bias", HeadHidden, flat)
+    l.value2_w = l.exact_weight("value.2.weight", 3, HeadHidden)
+    l.value2_b = l.bias("value.2.bias", 3, HeadHidden)
+    l.ttok_w = l.exact_weight("ttok.weight", HeadTokens, d)
+    l.ttok_b = l.bias("ttok.bias", HeadTokens, d)
+    l.time0_w = l.exact_weight("time.0.weight", HeadHidden, flat)
+    l.time0_b = l.bias("time.0.bias", HeadHidden, flat)
+    l.time2_w = l.exact_weight("time.2.weight", TimeBins, HeadHidden)
+    l.time2_b = l.bias("time.2.bias", TimeBins, HeadHidden)
+    l.sal_w = l.weight("sal.weight", 1, d)
+    l.sal_b = l.bias("sal.bias", 1, d)
+
+    l.ada_group = l.group(cfg.dc)
+    for i in 0..cfg.layers
+        l.member(&l.ada_group, l.blocks[i].ada_w, l.blocks[i].ada_b, 6 * cfg.d, cfg.dc)
+    l.member(&l.ada_group, l.final_w, l.final_b, 2 * cfg.d, cfg.dc)
+    l.close(&l.ada_group)
+    l.heads_group = l.group(cfg.d)
+    l.head_columns.q = l.member(&l.heads_group, l.pq_w, l.pq_b, cfg.dp, cfg.d)
+    l.head_columns.k = l.member(&l.heads_group, l.pk_w, l.pk_b, cfg.dp, cfg.d)
+    l.head_columns.under = l.member(&l.heads_group, l.under_w, l.under_b, 3, cfg.d)
+    l.head_columns.vtok = l.member(&l.heads_group, l.vtok_w, l.vtok_b, HeadTokens, cfg.d)
+    l.head_columns.ttok = l.member(&l.heads_group, l.ttok_w, l.ttok_b, HeadTokens, cfg.d)
+    l.head_columns.sal = l.member(&l.heads_group, l.sal_w, l.sal_b, 1, cfg.d)
+    l.close(&l.heads_group)
+    l.input_group = l.group(Inputs)
+    l.member(&l.input_group, l.inp_w, l.inp_b, cfg.d, Inputs)
+    l.close(&l.input_group)
+    if cfg.smolgen
+        for i in 0..cfg.layers
+            var g = l.group(cfg.d)
+            l.member(&g, l.blocks[i].qkv_w, l.blocks[i].qkv_b, 3 * cfg.d, cfg.d)
+            l.member(&g, l.blocks[i].sg_compress, -1, SmolCompress, cfg.d)
+            l.close(&g)
+            l.qkv_groups.push(g)
+    return l
+
+# splitmix64: a fast generator with good statistics, for the think-time mask and test values.
+struct Random
+    state: u64
+
+    fn next() -> u64
+        state = wrapping_add(state, 0x9E3779B97F4A7C15)
+        var z = state
+        z = wrapping_mul(z ^ (z >> 30), 0xBF58476D1CE4E5B9)
+        z = wrapping_mul(z ^ (z >> 27), 0x94D049BB133111EB)
+        return z ^ (z >> 31)
+
+    # Uniform in [0, 1).
+    fn unit() -> f64
+        return (next() >> 11) as f64 / 9007199254740992.0
+
+    # Standard normal (Box-Muller).
+    fn normal() -> f64
+        let u = 1.0 - unit()
+        return sqrt(-2.0 * log(u)) * cos(6.283185307179586 * unit())
+
+# PyTorch's generator on the CPU: MT19937, as torch.manual_seed(seed) leaves it.
+struct TorchRandom
+    state: [624]u32
+    at: int
+
+    fn seed(s: u32)
+        state[0] = s
+        for i in 1..624
+            state[i] = wrapping_add(wrapping_mul(1812433253 as u32, state[i - 1] ^ (state[i - 1] >> 30)), i as u32)
+        at = 624
+
+    fn next() -> u32
+        if at >= 624
+            for i in 0..624
+                let y = (state[i] & 0x80000000) | (state[(i + 1) % 624] & 0x7FFFFFFF)
+                let twist: u32 = y & 1 != 0 ? 0x9908B0DF : 0
+                state[i] = state[(i + 397) % 624] ^ (y >> 1) ^ twist
+            at = 0
+        var y = state[at]
+        at += 1
+        y ^= y >> 11
+        y ^= (y << 7) & 0x9D2C5680
+        y ^= (y << 15) & 0xEFC60000
+        y ^= y >> 18
+        return y
+
+    # Uniform in [0, 1) with 24 bits, as PyTorch draws a float32.
+    fn unit() -> f32
+        return (next() & 0xFFFFFF) as f32 * 0.000000059604644775390625
+
+    # Tensor.uniform_(-bound, bound) on n float32 values.
+    fn uniform(out: *f32, n: i64, bound: f64)
+        let lo = (-bound) as f32
+        let hi = bound as f32
+        for i in 0..n
+            out[i] = unit() * (hi - lo) + lo
+
+    # Draws and drops n values, for a tensor PyTorch initializes and the net then sets to zero.
+    fn skip(n: i64)
+        for i in 0..n
+            next()
+
+    # Tensor.normal_(0, 1) on n float32 values, times scale: PyTorch fills the tensor with
+    # uniforms and turns each 16 into 8 pairs of normals (Box-Muller), redoing the last 16 when n
+    # is not a multiple of 16. Its vectorized log, sin and cos differ from these in the last bit
+    # of some values. (Below 16 values PyTorch draws another way, which no tensor here needs.)
+    fn normal(out: *f32, n: i64, scale: f32)
+        for i in 0..n
+            out[i] = unit()
+        var i: i64 = 0
+        while i + 16 <= n
+            normal16(out + i)
+            i += 16
+        if n % 16 != 0 and n >= 16
+            let last = out + (n - 16)
+            for j in 0..16
+                last[j] = unit()
+            normal16(last)
+        if scale != 1.0
+            for j in 0..n
+                out[j] = out[j] * scale
+
+    fn normal16(data: *f32)
+        for j in 0..8
+            let u1 = 1.0 - data[j]
+            let u2 = data[j + 8]
+            let radius = sqrt(-2.0 * log(u1))
+            let theta = 6.2831855 * u2
+            data[j] = radius * cos(theta)
+            data[j + 8] = radius * sin(theta)
+
+# nn.Linear's start for a weight [n_out][n_in] at w and a bias at b (-1 for none):
+# kaiming_uniform_(a = sqrt(5)) and a bias within 1 / sqrt(n_in), with the bounds computed in
+# float64 as Python does.
+fn init_linear(rng: *TorchRandom, params: *f32, w: i64, b: i64, n_out: i64, n_in: i64)
+    let a = sqrt(5.0)
+    let gain = sqrt(2.0 / (1.0 + a * a))
+    rng.uniform(params + w, n_out * n_in, sqrt(3.0) * (gain / sqrt(n_in as f64)))
+    if b >= 0: rng.uniform(params + b, n_out, 1.0 / sqrt(n_in as f64))
+
+fn fill(out: *f32, n: i64, value: f32)
+    for i in 0..n
+        out[i] = value
+
+# A new net's parameters as PyTorch starts net.Net after torch.manual_seed(seed): its generator,
+# each layer's own initialization, and the order in which net.Net creates its layers, including
+# the draws for the layers it then sets to zero. A Linear's weights and biases come out with
+# PyTorch's bits, and the normal tables and embeddings within a unit in the last place, so a run
+# here and a Python run with the same seed start from the same net.
+fn init_params(l: *Layout, seed: u64) -> *f32
+    let params = alloc[f32](l.total)
+    let rng = new TorchRandom
+    rng.seed(seed as u32)
+    let cfg = l.cfg
+    let d = cfg.d as i64
+    let dc = cfg.dc as i64
+    let dp = cfg.dp as i64
+    let ffn = cfg.ffn as i64
+    let heads = cfg.heads as i64
+    let flat = 64 * HeadTokens
+    init_linear(rng, params, l.inp_w, l.inp_b, d, Inputs)
+    rng.normal(params + l.pos, 64 * d, 0.02)
+    rng.normal(params + l.own_rating, 4 * 23 * dc, 0.02)
+    rng.normal(params + l.opp_rating, 4 * 23 * dc, 0.02)
+    rng.normal(params + l.own_clock, 4 * 12 * dc, 0.02)
+    rng.normal(params + l.opp_clock, 4 * 12 * dc, 0.02)
+    rng.normal(params + l.think, 12 * dc, 0.02)
+    rng.normal(params + l.opp_think, 12 * dc, 0.02)
+    rng.normal(params + l.ply, 21 * dc, 0.02)
+    rng.normal(params + l.increment, 10 * dc, 1.0)
+    rng.normal(params + l.berserk, 4 * dc, 1.0)
+    rng.normal(params + l.kind, 4 * dc, 1.0)
+    rng.normal(params + l.speed, 6 * dc, 1.0)
+    init_linear(rng, params, l.mlp0_w, l.mlp0_b, dc, dc)
+    init_linear(rng, params, l.mlp2_w, l.mlp2_b, dc, dc)
+    for i in 0..cfg.layers
+        let b = &l.blocks[i]
+        # net.Block makes its smolgen first, then ada, which it sets to zero.
+        if cfg.smolgen
+            init_linear(rng, params, b.sg_compress, -1, SmolCompress, d)
+            init_linear(rng, params, b.sg_w0, b.sg_b0, SmolHidden, 64 * SmolCompress)
+            fill(params + b.sg_ln_w, SmolHidden, 1.0)
+            init_linear(rng, params, b.sg_w3, b.sg_b3, heads * SmolCode, SmolHidden)
+            fill(params + b.sg_norm_w, SmolCode, 1.0)
+        rng.skip(6 * d * dc + 6 * d)
+        init_linear(rng, params, b.qkv_w, b.qkv_b, 3 * d, d)
+        init_linear(rng, params, b.out_w, b.out_b, d, d)
+        init_linear(rng, params, b.ff1_w, b.ff1_b, ffn, d)
+        init_linear(rng, params, b.ff2_w, b.ff2_b, d, ffn)
+    # smolgen_shared and final_ada are drawn and set to zero.
+    if cfg.smolgen: rng.skip(4096 * SmolCode)
+    rng.skip(2 * d * dc + 2 * d)
+    init_linear(rng, params, l.pq_w, l.pq_b, dp, d)
+    init_linear(rng, params, l.pk_w, l.pk_b, dp, d)
+    init_linear(rng, params, l.under_w, l.under_b, 3, d)
+    init_linear(rng, params, l.vtok_w, l.vtok_b, HeadTokens, d)
+    init_linear(rng, params, l.value0_w, l.value0_b, HeadHidden, flat)
+    init_linear(rng, params, l.value2_w, l.value2_b, 3, HeadHidden)
+    init_linear(rng, params, l.ttok_w, l.ttok_b, HeadTokens, d)
+    init_linear(rng, params, l.time0_w, l.time0_b, HeadHidden, flat)
+    init_linear(rng, params, l.time2_w, l.time2_b, TimeBins, HeadHidden)
+    init_linear(rng, params, l.sal_w, l.sal_b, 1, d)
+    return params

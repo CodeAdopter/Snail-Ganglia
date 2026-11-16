@@ -1,0 +1,4 @@
+# The positions tool. Its board and move generator are the Snail Chess engine's.
+main = "positions.snail"
+output = "build/positions.exe"
+libs = ["C:/Zero Chess/src", "C:/Snail/Snail/lib/chess"]

@@ -1,0 +1,632 @@
+# The net's other layers in f32, forward and backward: layer norms, activations, gated residual
+# adds, attention.
+
+use cuda/driver
+use kernels/gemm
+
+const NormEps: f32 = 0.00001
+
+fn warp_sum(v: f32) -> f32
+    var s = v
+    s += warp_shuffle_xor(s, 16)
+    s += warp_shuffle_xor(s, 8)
+    s += warp_shuffle_xor(s, 4)
+    s += warp_shuffle_xor(s, 2)
+    s += warp_shuffle_xor(s, 1)
+    return s
+
+# The mean and 1 / standard deviation of a row of n, from one warp.
+fn row_stats(x: *f32, n: int) -> (f32, f32)
+    let lane = lane_index()
+    var sum: f32 = 0.0
+    var j = lane
+    while j < n
+        sum += x[j]
+        j += 32
+    let mean = warp_sum(sum) / n as f32
+    var sq: f32 = 0.0
+    j = lane
+    while j < n
+        let t = x[j] - mean
+        sq += t * t
+        j += 32
+    return mean, rsqrt(warp_sum(sq) / n as f32 + NormEps)
+
+fn warp_row() -> int
+    return (block_index().x * block_size().x + thread_index().x) / 32
+
+# ---- forward ----------------------------------------------------------------------------------
+
+# y = norm(x) * (1 + scale) + shift for rows of d, one warp per row (net.Block's adaptive layer
+# norm). Each position's 64 rows share a row of mod, whose columns scale_at and shift_at start
+# scale and shift.
+@kernel
+fn ada_norm(rows: int, d: int, x: *f32, y: *f32, mod: *f32, mod_row: int, scale_at: int, shift_at: int)
+    let row = warp_row()
+    if row >= rows: return
+    let xr = x + row as i64 * d
+    let (mean, inv) = row_stats(xr, d)
+    let mr = mod + (row / 64) as i64 * mod_row
+    let yr = y + row as i64 * d
+    var j = lane_index()
+    while j < d
+        yr[j] = (xr[j] - mean) * inv * (1.0 + mr[scale_at + j]) + mr[shift_at + j]
+        j += 32
+
+# y = norm(x) * w + b for rows of n, one warp per row (nn.LayerNorm); y may be x.
+@kernel
+fn layer_norm(rows: int, n: int, x: *f32, y: *f32, w: *f32, b: *f32)
+    let row = warp_row()
+    if row >= rows: return
+    let xr = x + row as i64 * n
+    let yr = y + row as i64 * n
+    let (mean, inv) = row_stats(xr, n)
+    var j = lane_index()
+    while j < n
+        yr[j] = (xr[j] - mean) * inv * w[j] + b[j]
+        j += 32
+
+fn sigmoid(x: f32) -> f32
+    return 1.0 / (1.0 + exp(-x))
+
+fn silu(x: f32) -> f32
+    return x / (1.0 + exp(-x))
+
+fn gelu(x: f32) -> f32
+    return x * 0.5 * (1.0 + erf(x * 0.70710678118654752))
+
+# y = silu(x) or gelu(x) for n values; y may be x.
+@kernel
+fn silu_all(n: int, x: *f32, y: *f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i < n: y[i] = silu(x[i])
+
+@kernel
+fn gelu_all(n: int, x: *f32, y: *f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i < n: y[i] = gelu(x[i])
+
+# out = x + gate * add for rows of d, the gate a row of mod per position starting at column gate_at.
+@kernel
+fn gated_sum(rows: int, d: int, x: *f32, add: *f32, mod: *f32, mod_row: int, gate_at: int, out: *f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i >= rows * d: return
+    let row = i / d
+    let j = i - row * d
+    out[i] = x[i] + mod[(row / 64) as i64 * mod_row + gate_at + j] * add[i]
+
+# x[row] += add[row % period] for rows of n: a table of period rows added to each run of period
+# rows (the position embedding, one row per square).
+@kernel
+fn add_rows(rows: int, n: int, period: int, x: *f32, add: *f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i >= rows * n: return
+    let row = i / n
+    x[i] += add[(row % period) * n + i - row * n]
+
+# The relative position of square j seen from square i, an index into a head's 225 biases
+# (net.REL_INDEX).
+fn rel_index(i: int, j: int) -> int
+    return ((j & 7) - (i & 7) + 7) * 15 + ((j >> 3) - (i >> 3) + 7)
+
+# Square i's attention scores over the 64 squares, softmaxed into p: q k / sqrt(dh) + rel +
+# bias. Returns the softmax's denominator over exp(score - max).
+fn attention_row(i: int, h: int, heads: int, dh: int, q: *f32, ks: *f32, rel: *f32, bias: *f32, p: *f32) -> f32
+    let scale = 1.0 / sqrt(dh as f32)
+    var most: f32 = -3.0e38
+    for j in 0..64
+        var s: f32 = 0.0
+        for t in 0..dh
+            s = fma(q[t], ks[j * dh + t], s)
+        s = s * scale + rel[h * 225 + rel_index(i, j)]
+        if bias != null: s += bias[j]
+        p[j] = s
+        most = max(most, s)
+    var total: f32 = 0.0
+    for j in 0..64
+        let e = exp(p[j] - most)
+        p[j] = e
+        total += e
+    return total
+
+# Attention for one head of one position per block, one query square per thread (64 threads):
+# softmax(q k / sqrt(dh) + rel + bias) v. qkv is [positions * 64][3 d] with q, k and v each
+# [heads][dh]; bias, unless null, is smolgen's [positions][heads][64][64]; out is
+# [positions * 64][d]. The grid is heads x positions, with 2 * 64 * dh floats of shared memory.
+@kernel
+fn attention(heads: int, dh: int, qkv: *f32, rel: *f32, bias: *f32, out: *f32)
+    let h = block_index().x
+    let p = block_index().y as i64
+    let i = thread_index().x
+    let d = heads * dh
+    let base = qkv + p * 64 * 3 * d
+    let kv = shared_memory[f32]()
+    for t in 0..dh
+        kv[i * dh + t] = base[i * 3 * d + d + h * dh + t]
+        kv[64 * dh + i * dh + t] = base[i * 3 * d + 2 * d + h * dh + t]
+    sync_threads()
+    var e: [64]f32
+    let brow = bias == null ? bias : bias + ((p * heads + h) * 64 + i) * 64
+    let total = attention_row(i, h, heads, dh, base + i * 3 * d + h * dh, kv, rel, brow, &e[0])
+    let o = out + (p * 64 + i) * d + h * dh
+    for t in 0..dh
+        var v: f32 = 0.0
+        for j in 0..64
+            v = fma(e[j], kv[64 * dh + j * dh + t], v)
+        o[t] = v / total
+
+# ---- backward ---------------------------------------------------------------------------------
+
+# The gradient of x through ada_norm, one warp per row: with g = dy (1 + scale) and xhat the
+# normed x, dx = (g - mean(g) - xhat mean(g xhat)) / std, added to dx when accumulate is set.
+# Writes each row's mean and 1 / std to stats for ada_norm_back_mod.
+@kernel
+fn ada_norm_back(rows: int, d: int, x: *f32, dy: *f32, mod: *f32, mod_row: int, scale_at: int, dx: *f32, accumulate: bool, stats: *f32)
+    let row = warp_row()
+    if row >= rows: return
+    let xr = x + row as i64 * d
+    let gr = dy + row as i64 * d
+    let mr = mod + (row / 64) as i64 * mod_row + scale_at
+    let (mean, inv) = row_stats(xr, d)
+    var m1: f32 = 0.0
+    var m2: f32 = 0.0
+    var j = lane_index()
+    while j < d
+        let g = gr[j] * (1.0 + mr[j])
+        m1 += g
+        m2 += g * (xr[j] - mean) * inv
+        j += 32
+    m1 = warp_sum(m1) / d as f32
+    m2 = warp_sum(m2) / d as f32
+    let out = dx + row as i64 * d
+    j = lane_index()
+    while j < d
+        let g = gr[j] * (1.0 + mr[j])
+        let v = (g - m1 - (xr[j] - mean) * inv * m2) * inv
+        out[j] = accumulate ? out[j] + v : v
+        j += 32
+    if lane_index() == 0
+        stats[2 * row] = mean
+        stats[2 * row + 1] = inv
+
+# The gradients of ada_norm's scale and shift, one block per position, one thread per column:
+# the sums over the position's 64 rows of dy xhat and of dy, into dmod's columns scale_at and
+# shift_at.
+@kernel
+fn ada_norm_back_mod(d: int, x: *f32, dy: *f32, stats: *f32, dmod: *f32, mod_row: int, scale_at: int, shift_at: int)
+    let p = block_index().x as i64
+    var j = thread_index().x
+    while j < d
+        var ds: f32 = 0.0
+        var dsh: f32 = 0.0
+        for r in 0..64
+            let row = p * 64 + r
+            let g = dy[row * d + j]
+            ds += g * (x[row * d + j] - stats[2 * row]) * stats[2 * row + 1]
+            dsh += g
+        dmod[p * mod_row + scale_at + j] = ds
+        dmod[p * mod_row + shift_at + j] = dsh
+        j += block_size().x
+
+# The backward pass of gated_sum for out's gradient dout: the gate's gradient, the sum over each
+# position's rows of dout * add, into dmod's column gate_at; and dadd = dout * gate. One block per
+# position, one thread per column.
+@kernel
+fn gate_back(d: int, dout: *f32, add: *f32, mod: *f32, mod_row: int, gate_at: int, dmod: *f32, dadd: *f32)
+    let p = block_index().x as i64
+    var j = thread_index().x
+    while j < d
+        let gate = mod[p * mod_row + gate_at + j]
+        var dg: f32 = 0.0
+        for r in 0..64
+            let at = (p * 64 + r) * d + j
+            dg += dout[at] * add[at]
+            dadd[at] = dout[at] * gate
+        dmod[p * mod_row + gate_at + j] = dg
+        j += block_size().x
+
+# dx = dy * silu'(x) or dy * gelu'(x), with x the activation's input; dx may be dy.
+@kernel
+fn silu_back(n: int, x: *f32, dy: *f32, dx: *f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i >= n: return
+    let s = sigmoid(x[i])
+    dx[i] = dy[i] * s * (1.0 + x[i] * (1.0 - s))
+
+@kernel
+fn gelu_back(n: int, x: *f32, dy: *f32, dx: *f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i >= n: return
+    let v = x[i]
+    let cdf = 0.5 * (1.0 + erf(v * 0.70710678118654752))
+    let pdf = exp(-0.5 * v * v) * 0.39894228040143268
+    dx[i] = dy[i] * (cdf + v * pdf)
+
+# The gradient of x through layer_norm, one warp per row: with g = dy w, dx = (g - mean(g) -
+# xhat mean(g xhat)) / std. Writes each row's mean and 1 / std to stats.
+@kernel
+fn layer_norm_back(rows: int, n: int, x: *f32, dy: *f32, w: *f32, dx: *f32, stats: *f32)
+    let row = warp_row()
+    if row >= rows: return
+    let xr = x + row as i64 * n
+    let gr = dy + row as i64 * n
+    let (mean, inv) = row_stats(xr, n)
+    var m1: f32 = 0.0
+    var m2: f32 = 0.0
+    var j = lane_index()
+    while j < n
+        let g = gr[j] * w[j]
+        m1 += g
+        m2 += g * (xr[j] - mean) * inv
+        j += 32
+    m1 = warp_sum(m1) / n as f32
+    m2 = warp_sum(m2) / n as f32
+    let out = dx + row as i64 * n
+    j = lane_index()
+    while j < n
+        let g = gr[j] * w[j]
+        out[j] = (g - m1 - (xr[j] - mean) * inv * m2) * inv
+        j += 32
+    if lane_index() == 0
+        stats[2 * row] = mean
+        stats[2 * row + 1] = inv
+
+# The gradients of layer_norm's weight and bias: sums over rows of dy xhat and of dy, added to dw
+# and db. Each block takes 64 rows, one thread per column, and adds its sums with atomics.
+@kernel
+fn layer_norm_back_params(rows: int, n: int, x: *f32, dy: *f32, stats: *f32, dw: *f32, db: *f32)
+    let first = block_index().x * 64
+    let last = min(first + 64, rows)
+    var j = thread_index().x
+    while j < n
+        var sw: f32 = 0.0
+        var sb: f32 = 0.0
+        for r in first..last
+            let at = r as i64 * n + j
+            sw += dy[at] * (x[at] - stats[2 * r]) * stats[2 * r + 1]
+            sb += dy[at]
+        atomic_add(&dw[j], sw)
+        atomic_add(&db[j], sb)
+        j += block_size().x
+
+# layer_norm_back_params without the atomics, which many blocks adding to the same few floats
+# make slow: each block of 64 rows writes its sums to row block_index().x of sums [blocks][2 n],
+# dy xhat in the first n columns and dy in the rest, for column_sums to add.
+@kernel
+fn layer_norm_back_sums(rows: int, n: int, x: *f32, dy: *f32, stats: *f32, sums: *f32)
+    let first = block_index().x * 64
+    let last = min(first + 64, rows)
+    let to = sums + block_index().x as i64 * 2 * n
+    var j = thread_index().x
+    while j < n
+        var sw: f32 = 0.0
+        var sb: f32 = 0.0
+        for r in first..last
+            let at = r as i64 * n + j
+            sw += dy[at] * (x[at] - stats[2 * r]) * stats[2 * r + 1]
+            sb += dy[at]
+        to[j] = sw
+        to[n + j] = sb
+        j += block_size().x
+
+# The backward pass of attention for one head of one position per block, one square per thread.
+# With P the softmax of the forward pass (recomputed here), O its output and dO the gradient of
+# O: dV = P^T dO, dS = P (dO V^T - rowsum(dO O)), dQ = dS K / sqrt(dh), dK = dS^T Q / sqrt(dh).
+# dS is also the gradient of the relative biases, summed into drel, and of smolgen's biases,
+# written to dbias when bias is not null. dqkv is laid out as qkv. Shared memory: K, V, Q and dO
+# (64 x dh each), P (64 x 64) and 256 floats for the relative biases' gradient.
+@kernel
+fn attention_back(heads: int, dh: int, qkv: *f32, out: *f32, dout: *f32, rel: *f32, bias: *f32, dqkv: *f32, drel: *f32, dbias: *f32)
+    let h = block_index().x
+    let p = block_index().y as i64
+    let i = thread_index().x
+    let d = heads * dh
+    let base = qkv + p * 64 * 3 * d
+    let mem = shared_memory[f32]()
+    let ks = mem
+    let vs = mem + 64 * dh
+    let qs = mem + 2 * 64 * dh
+    let gs = mem + 3 * 64 * dh
+    let ps = mem + 4 * 64 * dh
+    let rs = ps + 4096
+    for t in 0..dh
+        ks[i * dh + t] = base[i * 3 * d + d + h * dh + t]
+        vs[i * dh + t] = base[i * 3 * d + 2 * d + h * dh + t]
+        qs[i * dh + t] = base[i * 3 * d + h * dh + t]
+        gs[i * dh + t] = dout[(p * 64 + i) * d + h * dh + t]
+    var r = i
+    while r < 256
+        rs[r] = 0.0
+        r += 64
+    sync_threads()
+    let brow = bias == null ? bias : bias + ((p * heads + h) * 64 + i) * 64
+    let prow = ps + i * 64
+    let total = attention_row(i, h, heads, dh, qs + i * dh, ks, rel, brow, prow)
+    for j in 0..64
+        prow[j] = prow[j] / total
+    let o = out + (p * 64 + i) * d + h * dh
+    var di: f32 = 0.0
+    for t in 0..dh
+        di += gs[i * dh + t] * o[t]
+    sync_threads()
+    # Thread j: dV of square j, reading column j of P.
+    let row = dqkv + (p * 64 + i) * 3 * d
+    for t in 0..dh
+        var v: f32 = 0.0
+        for k in 0..64
+            v = fma(ps[k * 64 + i], gs[k * dh + t], v)
+        row[2 * d + h * dh + t] = v
+    sync_threads()
+    # Thread i: row i of dS, in place of P.
+    let grow = dbias == null ? dbias : dbias + ((p * heads + h) * 64 + i) * 64
+    for j in 0..64
+        var dp: f32 = 0.0
+        for t in 0..dh
+            dp = fma(gs[i * dh + t], vs[j * dh + t], dp)
+        let ds = prow[j] * (dp - di)
+        prow[j] = ds
+        if grow != null: grow[j] = ds
+        atomic_add(&rs[rel_index(i, j)], ds)
+    sync_threads()
+    let scale = 1.0 / sqrt(dh as f32)
+    for t in 0..dh
+        var dq: f32 = 0.0
+        var dk: f32 = 0.0
+        for k in 0..64
+            dq = fma(prow[k], ks[k * dh + t], dq)
+            dk = fma(ps[k * 64 + i], qs[k * dh + t], dk)
+        row[h * dh + t] = dq * scale
+        row[d + h * dh + t] = dk * scale
+    r = i
+    while r < 225
+        atomic_add(&drel[h * 225 + r], rs[r])
+        r += 64
+
+# ---- attention for heads 32 wide ----------------------------------------------------------------
+#
+# The same computations for dh = 32 (v1 and v2), with every loop unrolled so that a thread's query,
+# scores and sums stay in registers. Rows that a thread reads on its own are padded in shared
+# memory (33 and 65 floats), so that a warp's 32 reads fall in 32 different banks; rows that every
+# thread reads at once are broadcast. The products and sums run in the order of the general
+# kernels above, so the results are the same.
+
+const Head = 32
+
+# Copies one head's 64 x 32 slice of qkv (part 0 q, 1 k, 2 v) into shared memory with rows stride
+# floats apart, the block's 64 threads reading consecutive floats.
+fn stage_head(base: *f32, d: int, h: int, part: int, out: *f32, stride: int)
+    let i = thread_index().x
+    @unroll
+    for e in 0..32
+        let idx = i + 64 * e
+        let row = idx / Head
+        let col = idx % Head
+        out[row * stride + col] = base[row * 3 * d + part * d + h * Head + col]
+
+@kernel
+fn attention32(heads: int, qkv: *f32, rel: *f32, bias: *f32, out: *f32)
+    let h = block_index().x
+    let p = block_index().y as i64
+    let i = thread_index().x
+    let d = heads * Head
+    let base = qkv + p * 64 * 3 * d
+    let ks = shared_memory[f32]()
+    let vs = ks + 64 * Head
+    stage_head(base, d, h, 1, ks, Head)
+    stage_head(base, d, h, 2, vs, Head)
+    sync_threads()
+    var q: [32]f32
+    @unroll
+    for t in 0..Head
+        q[t] = base[i * 3 * d + h * Head + t]
+    let scale = 1.0 / sqrt(Head as f32)
+    let brow = bias == null ? bias : bias + ((p * heads + h) * 64 + i) * 64
+    var e: [64]f32
+    var most: f32 = -3.0e38
+    @unroll
+    for j in 0..64
+        var s: f32 = 0.0
+        @unroll
+        for t in 0..Head
+            s = fma(q[t], ks[j * Head + t], s)
+        s = s * scale + rel[h * 225 + rel_index(i, j)]
+        if brow != null: s += brow[j]
+        e[j] = s
+        most = max(most, s)
+    var total: f32 = 0.0
+    @unroll
+    for j in 0..64
+        e[j] = exp(e[j] - most)
+        total += e[j]
+    var o: [32]f32
+    @unroll
+    for j in 0..64
+        @unroll
+        for t in 0..Head
+            o[t] = fma(e[j], vs[j * Head + t], o[t])
+    let row = out + (p * 64 + i) * d + h * Head
+    @unroll
+    for t in 0..Head
+        row[t] = o[t] / total
+
+# attention_back for dh = 32. Shared memory: K, V, Q and dO with rows of 33 floats, P (then dS)
+# with rows of 65, and 256 floats for the relative biases' gradient.
+@kernel
+fn attention_back32(heads: int, qkv: *f32, out: *f32, dout: *f32, rel: *f32, bias: *f32, dqkv: *f32, drel: *f32, dbias: *f32)
+    let h = block_index().x
+    let p = block_index().y as i64
+    let i = thread_index().x
+    let d = heads * Head
+    let base = qkv + p * 64 * 3 * d
+    let mem = shared_memory[f32]()
+    let ks = mem
+    let vs = mem + 64 * 33
+    let qs = mem + 2 * 64 * 33
+    let gs = mem + 3 * 64 * 33
+    let ps = mem + 4 * 64 * 33
+    let rs = ps + 64 * 65
+    stage_head(base, d, h, 1, ks, 33)
+    stage_head(base, d, h, 2, vs, 33)
+    stage_head(base, d, h, 0, qs, 33)
+    @unroll
+    for e in 0..32
+        let idx = i + 64 * e
+        gs[(idx / Head) * 33 + idx % Head] = dout[(p * 64 + idx / Head) * d + h * Head + idx % Head]
+    var r = i
+    while r < 256
+        rs[r] = 0.0
+        r += 64
+    sync_threads()
+    var q: [32]f32
+    var g: [32]f32
+    @unroll
+    for t in 0..Head
+        q[t] = qs[i * 33 + t]
+        g[t] = gs[i * 33 + t]
+    # Row i of P, as the forward pass computed it.
+    let scale = 1.0 / sqrt(Head as f32)
+    let brow = bias == null ? bias : bias + ((p * heads + h) * 64 + i) * 64
+    var e: [64]f32
+    var most: f32 = -3.0e38
+    @unroll
+    for j in 0..64
+        var s: f32 = 0.0
+        @unroll
+        for t in 0..Head
+            s = fma(q[t], ks[j * 33 + t], s)
+        s = s * scale + rel[h * 225 + rel_index(i, j)]
+        if brow != null: s += brow[j]
+        e[j] = s
+        most = max(most, s)
+    var total: f32 = 0.0
+    @unroll
+    for j in 0..64
+        e[j] = exp(e[j] - most)
+        total += e[j]
+    @unroll
+    for j in 0..64
+        e[j] = e[j] / total
+        ps[i * 65 + j] = e[j]
+    let o = out + (p * 64 + i) * d + h * Head
+    var di: f32 = 0.0
+    @unroll
+    for t in 0..Head
+        di += g[t] * o[t]
+    sync_threads()
+    # Thread j: dV of square j, from column j of P.
+    let row = dqkv + (p * 64 + i) * 3 * d
+    var acc: [32]f32
+    @unroll
+    for k in 0..64
+        let pk = ps[k * 65 + i]
+        @unroll
+        for t in 0..Head
+            acc[t] = fma(pk, gs[k * 33 + t], acc[t])
+    @unroll
+    for t in 0..Head
+        row[2 * d + h * Head + t] = acc[t]
+    # Thread i: row i of dS, kept in e and, once every thread has read P, in place of it.
+    let grow = dbias == null ? dbias : dbias + ((p * heads + h) * 64 + i) * 64
+    @unroll
+    for j in 0..64
+        var dp: f32 = 0.0
+        @unroll
+        for t in 0..Head
+            dp = fma(g[t], vs[j * 33 + t], dp)
+        e[j] = e[j] * (dp - di)
+        if grow != null: grow[j] = e[j]
+        atomic_add(&rs[rel_index(i, j)], e[j])
+    sync_threads()
+    @unroll
+    for j in 0..64
+        ps[i * 65 + j] = e[j]
+    sync_threads()
+    var dq: [32]f32
+    var dk: [32]f32
+    @unroll
+    for k in 0..64
+        let sk = ps[k * 65 + i]
+        @unroll
+        for t in 0..Head
+            dq[t] = fma(e[k], ks[k * 33 + t], dq[t])
+            dk[t] = fma(sk, qs[k * 33 + t], dk[t])
+    @unroll
+    for t in 0..Head
+        row[h * Head + t] = dq[t] * scale
+        row[d + h * Head + t] = dk[t] * scale
+    r = i
+    while r < 225
+        atomic_add(&drel[h * 225 + r], rs[r])
+        r += 64
+
+fn attention_back32_shared() -> int
+    return (4 * 64 * 33 + 64 * 65 + 256) * 4
+
+# ---- launches ---------------------------------------------------------------------------------
+
+fn blocks_for(n: i64, per: int) -> int
+    return ((n + per - 1) / per) as int
+
+fn run_ada_norm(rows: int, d: int, x: DeviceMemory, y: DeviceMemory, mod: DeviceMemory, mod_row: int, scale_at: int, shift_at: int)
+    launch(&kernels, blocks_for(rows, 8), 256, 0, gpu_args(ada_norm, rows, d, x, y, mod, mod_row, scale_at, shift_at))
+
+fn run_layer_norm(rows: int, n: int, x: DeviceMemory, y: DeviceMemory, w: DeviceMemory, b: DeviceMemory)
+    launch(&kernels, blocks_for(rows, 8), 256, 0, gpu_args(layer_norm, rows, n, x, y, w, b))
+
+fn run_silu(n: i64, x: DeviceMemory, y: DeviceMemory)
+    launch(&kernels, blocks_for(n, 256), 256, 0, gpu_args(silu_all, n as int, x, y))
+
+fn run_gelu(n: i64, x: DeviceMemory, y: DeviceMemory)
+    launch(&kernels, blocks_for(n, 256), 256, 0, gpu_args(gelu_all, n as int, x, y))
+
+fn run_gated_sum(rows: int, d: int, x: DeviceMemory, add: DeviceMemory, mod: DeviceMemory, mod_row: int, gate_at: int, out: DeviceMemory)
+    launch(&kernels, blocks_for(rows as i64 * d, 256), 256, 0, gpu_args(gated_sum, rows, d, x, add, mod, mod_row, gate_at, out))
+
+fn run_add_rows(rows: int, n: int, period: int, x: DeviceMemory, add: DeviceMemory)
+    launch(&kernels, blocks_for(rows as i64 * n, 256), 256, 0, gpu_args(add_rows, rows, n, period, x, add))
+
+fn run_attention(positions: int, heads: int, dh: int, qkv: DeviceMemory, rel: DeviceMemory, bias: DeviceMemory, out: DeviceMemory)
+    if dh == Head
+        launch_on(&kernels, Stream(handle: null), heads, positions, 1, 64, 1, 1, 2 * 64 * Head * 4,
+            gpu_args(attention32, heads, qkv, rel, bias, out))
+        return
+    launch_on(&kernels, Stream(handle: null), heads, positions, 1, 64, 1, 1, 2 * 64 * dh * 4,
+        gpu_args(attention, heads, dh, qkv, rel, bias, out))
+
+fn run_ada_norm_back(rows: int, d: int, x: DeviceMemory, dy: DeviceMemory, mod: DeviceMemory, mod_row: int, scale_at: int, shift_at: int, dx: DeviceMemory, accumulate: bool, stats: DeviceMemory, dmod: DeviceMemory)
+    launch(&kernels, blocks_for(rows, 8), 256, 0, gpu_args(ada_norm_back, rows, d, x, dy, mod, mod_row, scale_at, dx, accumulate, stats))
+    launch(&kernels, rows / 64, 128, 0, gpu_args(ada_norm_back_mod, d, x, dy, stats, dmod, mod_row, scale_at, shift_at))
+
+fn run_gate_back(rows: int, d: int, dout: DeviceMemory, add: DeviceMemory, mod: DeviceMemory, mod_row: int, gate_at: int, dmod: DeviceMemory, dadd: DeviceMemory)
+    launch(&kernels, rows / 64, 128, 0, gpu_args(gate_back, d, dout, add, mod, mod_row, gate_at, dmod, dadd))
+
+fn run_silu_back(n: i64, x: DeviceMemory, dy: DeviceMemory, dx: DeviceMemory)
+    launch(&kernels, blocks_for(n, 256), 256, 0, gpu_args(silu_back, n as int, x, dy, dx))
+
+fn run_gelu_back(n: i64, x: DeviceMemory, dy: DeviceMemory, dx: DeviceMemory)
+    launch(&kernels, blocks_for(n, 256), 256, 0, gpu_args(gelu_back, n as int, x, dy, dx))
+
+# dx and the parameter gradients dw and db of layer_norm. dx must not be dy, which the second
+# kernel reads after the first has written dx and the statistics.
+fn run_layer_norm_back(rows: int, n: int, x: DeviceMemory, dy: DeviceMemory, w: DeviceMemory, dx: DeviceMemory, stats: DeviceMemory, dw: DeviceMemory, db: DeviceMemory)
+    launch(&kernels, blocks_for(rows, 8), 256, 0, gpu_args(layer_norm_back, rows, n, x, dy, w, dx, stats))
+    launch(&kernels, blocks_for(rows, 64), 128, 0, gpu_args(layer_norm_back_params, rows, n, x, dy, stats, dw, db))
+
+# run_layer_norm_back with the parameters' sums through sums, [rows / 64 rounded up][2 n] f32 of
+# scratch, when dw and db are next to each other in the gradient (a LayerNorm's weight, then its
+# bias): dw_db is where dw starts.
+fn run_layer_norm_back_sums(rows: int, n: int, x: DeviceMemory, dy: DeviceMemory, w: DeviceMemory, dx: DeviceMemory, stats: DeviceMemory, sums: DeviceMemory, dw_db: DeviceMemory)
+    launch(&kernels, blocks_for(rows, 8), 256, 0, gpu_args(layer_norm_back, rows, n, x, dy, w, dx, stats))
+    launch(&kernels, blocks_for(rows, 64), 128, 0, gpu_args(layer_norm_back_sums, rows, n, x, dy, stats, sums))
+    run_column_sums(blocks_for(rows, 64), 2 * n, sums, dw_db)
+
+fn attention_back_shared(dh: int) -> int
+    return (4 * 64 * dh + 4096 + 256) * 4
+
+fn run_attention_back(positions: int, heads: int, dh: int, qkv: DeviceMemory, out: DeviceMemory, dout: DeviceMemory, rel: DeviceMemory, bias: DeviceMemory, dqkv: DeviceMemory, drel: DeviceMemory, dbias: DeviceMemory)
+    if dh == Head
+        launch_on(&kernels, Stream(handle: null), heads, positions, 1, 64, 1, 1, attention_back32_shared(),
+            gpu_args(attention_back32, heads, qkv, out, dout, rel, bias, dqkv, drel, dbias))
+        return
+    launch_on(&kernels, Stream(handle: null), heads, positions, 1, 64, 1, 1, attention_back_shared(dh),
+        gpu_args(attention_back, heads, dh, qkv, out, dout, rel, bias, dqkv, drel, dbias))

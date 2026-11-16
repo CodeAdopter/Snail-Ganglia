@@ -1,0 +1,273 @@
+# Ganglia: the net that predicts which move a human plays and how long they think (README.md).
+#
+#   ganglia check <weights.gnet> <reference.ref>
+#   ganglia gradcheck <weights.gnet> <grad.ref>
+#   ganglia stepcheck <last.gnet> <step.ref> [<grad.ref>]
+#   ganglia eval <weights.gnet> <test.bin> [--batch N] [--limit N] [--stride N] [--compare <python.top>] [--bins <file.tsv>]
+#   ganglia train --run <dir> (--games <dir> --positions-exe <positions.exe> | --records <file>) --val <test.bin> [options]
+#   ganglia profile <weights.gnet> <test.bin>
+#   ganglia halfcheck <weights.gnet> <test.bin> [positions]
+#   ganglia initcheck <pytorch-initial.gnet> <seed>
+#   ganglia quantize <net> <out> [--bits 16|8|...|2]
+#   ganglia gemmcheck, ganglia mmcheck
+
+use cuda/driver
+use kernels/gemm
+use kernels/mm
+use check
+use evaluation
+use train
+use bench
+use half
+use options
+use timeset
+use timetrain
+use quantize
+
+fn usage()
+    print("usage:")
+    print("  ganglia check <weights.gnet> <reference.ref>      the forward pass against a reference file (weights/gnets/checks)")
+    print("  ganglia gradcheck <weights.gnet> <grad.ref>       the losses and gradients against a reference file")
+    print("  ganglia stepcheck <last.gnet> <step.ref> [<grad.ref>]  one optimizer step against a reference file")
+    print("  ganglia eval <weights.gnet> <test.bin> [--batch N] [--limit N] [--stride N] [--compare <python.top>] [--bins <file.tsv>] [--f32]")
+    print("      --stride N scores every Nth position (train's evaluations score every 10th);")
+    print("      --bins appends the counts per time class and 100-point rating bin to a table")
+    print("  ganglia gemmcheck                                 the tensor cores' products against f32, and their speed")
+    print("  ganglia mmcheck                                   the products on bf16 operands against f32, and their speed")
+    print("  ganglia halfcheck <weights.gnet> <test.bin> [positions]  the bf16 pass's losses and gradients against the f32 pass's")
+    print("  ganglia initcheck <pytorch-initial.gnet> <seed>   a new net's weights against PyTorch's for the same seed")
+    print("  ganglia initloss <grad.ref> <width> <layers> <heads> <smolgen 0|1>  new nets' losses, seeds 1 to 5")
+    print("  ganglia profile <weights.gnet> <test.bin> [--f32 | --no-half]  where a training step's time goes, at batch 1024")
+    print("  ganglia train --run <dir> --val <test.bin> (--games <dir> --positions-exe <positions.exe> | --records <positions.bin>)")
+    print("      [--positions N] [--batch N] [--lr X] [--wd X] [--width N] [--layers N] [--heads N] [--smolgen 0|1]")
+    print("      [--w-value X] [--w-time X] [--w-sal X] [--p X] [--cap X] [--seed N] [--init-seed N] [--log-every N] [--eval-every N]")
+    print("      [--resume <last.gnet>] [--init <weights.gnet>] [--cutoff YYYY-MM-DD] [--stop-at N] [--f32] [--no-half]")
+    print("      [--stall-seconds N] [--trace-from N] [--bullet 0|1] [--cond all|ends|input]")
+    print("      --bullet 1 trains on bullet games too, with rating and clock tables of their own in a new net;")
+    print("      --records trains on a file of positions.exe's training positions, read in order;")
+    print("      --cond gives a new net's condition to every block's norms and the final one (all), to the first")
+    print("      block's and the final one (ends), or to the first block's alone (input)")
+    print("  ganglia timedata --teacher <weights.gnet> --out <file.tset> --games <dir> --positions-exe <positions.exe>")
+    print("      [--rows N] [--seed N] [--batch N]      training positions for the small think-time net, with the full net's predictions")
+    print("  ganglia timedata --teacher <weights.gnet> --out <file.tset> --test <test.bin> [--batch N]   the same for a test file")
+    print("  ganglia timedata --records <records.bin> --out <file.tset> [--speed N] [--before YYYY-MM-DD]")
+    print("      training positions without the full net's predictions, of one time class (1 bullet) and of games before a day")
+    print("  ganglia timetrain --run <dir> --train <train.tset>[,<more.tset>...] --val <test.tset> [--groups clock,pace,board,move,squares,last,target]")
+    print("      [--embed N] [--hidden1 N] [--hidden2 N] [--positions N] [--batch N] [--lr X] [--wd X] [--distill X] [--distill-end X]")
+    print("      [--trunk N] [--trunk-layers N] [--trunk-heads N] [--trunk-out N] [--seed N] [--log-every N] [--eval-every N] [--f32]")
+    print("      trains the small think-time net; --trunk N adds a transformer N wide over the squares")
+    print("  ganglia timeeval --net <net.tnet> --val <test.tset> [--json <out.json>] [--row-scores <file>] [--row-probs <file>] [--f32]")
+    print("      scores it against real think times; the row files hold each scored position's probabilities")
+    print("  ganglia timecheck --set <file.tset> [--rows N]    the small net's passes on the GPU against the CPU")
+    print("  ganglia timedump --set <file.tset> --net <net.tnet> --out <file> [--rows N]   a net's inputs and logits for a time set's first rows")
+    print("  ganglia quantize <net.gnet|net.tnet> <out> [--bits N]   the net with its parameters as half floats (16), or with")
+    print("      its Linears' weights as integers of 8 (the default) down to 2 bits; every command reads the result as a net")
+    print("  eval and train run the bf16 pass, as PyTorch's autocast does (README.md); --no-half keeps the f32 pass with")
+    print("  its products on the tensor cores, and --f32 f32 alone. train ends a run in which no step finishes for")
+    print("  --stall-seconds (300; 0 waits forever), and --trace-from N names each part of a step as it finishes.")
+    exit(2)
+
+# The train command's options (train.py's arguments), from arg(first) on.
+fn train_settings(first: int) -> TrainSettings
+    var s: TrainSettings
+    tensor_cores = true
+    var i = first
+    while i < arg_count()
+        let o = arg(i)
+        if o == "--f32"
+            tensor_cores = false
+            i += 1
+            continue
+        if o == "--no-half"
+            half_pass = false
+            i += 1
+            continue
+        if i + 1 >= arg_count(): usage()
+        let v = arg(i + 1)
+        if o == "--run": s.run = v
+        elif o == "--games": s.games = v
+        elif o == "--records": s.records = v
+        elif o == "--bullet": s.bullet = parse_int(v) != 0
+        elif o == "--cond": s.cond = v
+        elif o == "--val": s.val = v
+        elif o == "--positions-exe": s.positions_exe = v
+        elif o == "--positions": s.positions = parse_float(v)
+        elif o == "--batch": s.batch = parse_int(v) as int
+        elif o == "--lr": s.lr = parse_float(v)
+        elif o == "--wd": s.wd = parse_float(v) as f32
+        elif o == "--width": s.width = parse_int(v) as int
+        elif o == "--layers": s.layers = parse_int(v) as int
+        elif o == "--heads": s.heads = parse_int(v) as int
+        elif o == "--smolgen": s.smolgen = parse_int(v) != 0
+        elif o == "--w-value": s.w_value = parse_float(v) as f32
+        elif o == "--w-time": s.w_time = parse_float(v) as f32
+        elif o == "--w-sal": s.w_sal = parse_float(v) as f32
+        elif o == "--p": s.p = parse_float(v)
+        elif o == "--cap": s.cap = parse_float(v)
+        elif o == "--seed": s.seed = parse_int(v) as int
+        elif o == "--init-seed": s.init_seed = parse_int(v) as int
+        elif o == "--log-every": s.log_every = parse_int(v) as int
+        elif o == "--eval-every": s.eval_every = parse_int(v) as int
+        elif o == "--resume": s.resume = v
+        elif o == "--init": s.init = v
+        elif o == "--cutoff": s.cutoff = v
+        elif o == "--stop-at": s.stop_at = parse_int(v) as int
+        elif o == "--trace-from": s.trace_from = parse_int(v) as int
+        elif o == "--stall-seconds": s.stall_seconds = parse_int(v) as int
+        else: usage()
+        i += 2
+    if s.run.len == 0 or s.val.len == 0: usage()
+    if s.records.len == 0 and (s.games.len == 0 or s.positions_exe.len == 0): usage()
+    if s.cond != "all" and s.cond != "ends" and s.cond != "input": usage()
+    if s.resume.len > 0 and s.init.len > 0: usage()
+    return s
+
+fn start_gpu()
+    let (gpu, ok) = gpu_open(0)
+    if not ok: panic("no NVIDIA GPU found")
+    if not can_load(gpu_code()): panic("this GPU is too old for Ganglia's kernels (needs compute 8.0 or later)")
+    kernels = load_module(gpu_code())
+    # attention_back keeps K, V, Q, dO and P of a head in shared memory: over 48 KB for 32-wide heads.
+    allow_shared(&kernels, "attention_back", attention_back_shared(64))
+    allow_shared(&kernels, "attention_back32", attention_back32_shared())
+    mm_allow_shared()
+    print("{gpu.name}, {gpu.memory / 1048576} MB")
+
+fn main()
+    if arg_count() < 2: usage()
+    let command = arg(1)
+    if command == "check"
+        if arg_count() != 4: usage()
+        start_gpu()
+        if not check_forward(arg(2), arg(3)): exit(1)
+    elif command == "gradcheck"
+        if arg_count() != 4: usage()
+        start_gpu()
+        if not check_gradients(arg(2), arg(3)): exit(1)
+    elif command == "profile"
+        if arg_count() < 4: usage()
+        tensor_cores = not (arg_count() > 4 and arg(arg_count() - 1) == "--f32")
+        half_pass = not (arg_count() > 4 and arg(arg_count() - 1) == "--no-half")
+        start_gpu()
+        profile_training(arg(2), arg(3), 1024, 3)
+    elif command == "initloss"
+        if arg_count() != 7: usage()
+        start_gpu()
+        initial_losses(arg(2), parse_int(arg(3)) as int, parse_int(arg(4)) as int, parse_int(arg(5)) as int, parse_int(arg(6)) != 0)
+    elif command == "gemmcheck"
+        start_gpu()
+        if not check_gemms(): exit(1)
+    elif command == "mmcheck"
+        start_gpu()
+        if not check_mm(): exit(1)
+    elif command == "initcheck"
+        if arg_count() != 4: usage()
+        if not check_init(arg(2), parse_int(arg(3)) as int): exit(1)
+    elif command == "halfcheck"
+        if arg_count() < 4: usage()
+        start_gpu()
+        if not check_half(arg(2), arg(3), arg_count() > 4 ? parse_int(arg(4)) as int : 256): exit(1)
+    elif command == "stepcheck"
+        if arg_count() != 4 and arg_count() != 5: usage()
+        start_gpu()
+        if not check_step(arg(2), arg(3), arg_count() == 5 ? arg(4) : ""): exit(1)
+    elif command == "train"
+        var settings = train_settings(2)
+        start_gpu()
+        if not train(&settings): exit(1)
+    elif command == "quantize"
+        if arg_count() != 4 and not (arg_count() == 6 and arg(4) == "--bits"): usage()
+        if not quantize_net(arg(2), arg(3), arg_count() == 6 ? parse_int(arg(5)) as int : 8): exit(1)
+    elif command == "timedata"
+        if not options_known(["--teacher", "--out", "--games", "--positions-exe", "--rows", "--seed", "--batch", "--test", "--stall-seconds", "--records", "--speed", "--before"], []): usage()
+        let teacher = opt("--teacher", "")
+        let out = opt("--out", "")
+        let test = opt("--test", "")
+        if out.len == 0: usage()
+        if opt("--records", "").len > 0
+            if not build_plain_set(opt("--records", ""), out, opt_int("--speed", -1) as int, opt("--before", "")): exit(1)
+            return
+        if teacher.len == 0: usage()
+        let batch = opt_int("--batch", 1024) as int
+        tensor_cores = true
+        start_gpu()
+        if test.len > 0
+            if not build_test_set(teacher, test, out, batch): exit(1)
+        else
+            let games = opt("--games", "")
+            let positions_exe = opt("--positions-exe", "")
+            if games.len == 0 or positions_exe.len == 0: usage()
+            if not build_train_set(teacher, games, positions_exe, out, opt_int("--rows", 40000000), opt_int("--seed", 101) as int, batch, opt_int("--stall-seconds", 600) as int): exit(1)
+    elif command == "timetrain"
+        if not options_known(["--run", "--train", "--val", "--groups", "--embed", "--hidden1", "--hidden2", "--positions", "--batch", "--lr", "--wd", "--distill", "--distill-end", "--seed", "--log-every", "--eval-every", "--trunk", "--trunk-layers", "--trunk-heads", "--trunk-out"], ["--f32"]): usage()
+        var s: TimeTrainSettings
+        s.run = opt("--run", "")
+        s.train = opt("--train", "")
+        s.val = opt("--val", "")
+        if s.run.len == 0 or s.train.len == 0 or s.val.len == 0: usage()
+        if opt("--groups", "").len > 0: s.groups = parse_groups(opt("--groups", ""))
+        s.embed = opt_int("--embed", s.embed) as int
+        s.hidden1 = opt_int("--hidden1", s.hidden1) as int
+        s.hidden2 = opt_int("--hidden2", s.hidden2) as int
+        s.trunk = opt_int("--trunk", s.trunk) as int
+        s.trunk_layers = opt_int("--trunk-layers", s.trunk_layers) as int
+        s.trunk_heads = opt_int("--trunk-heads", s.trunk_heads) as int
+        s.trunk_out = opt_int("--trunk-out", s.trunk_out) as int
+        s.positions = opt_float("--positions", s.positions)
+        s.batch = opt_int("--batch", s.batch) as int
+        s.lr = opt_float("--lr", s.lr)
+        s.wd = opt_float("--wd", s.wd as f64) as f32
+        s.distill = opt_float("--distill", s.distill)
+        s.distill_end = opt_float("--distill-end", s.distill_end)
+        s.seed = opt_int("--seed", s.seed) as int
+        s.log_every = opt_int("--log-every", s.log_every) as int
+        s.eval_every = opt_int("--eval-every", s.eval_every) as int
+        tensor_cores = not has_flag("--f32")
+        start_gpu()
+        if not time_train(&s): exit(1)
+    elif command == "timeeval"
+        if not options_known(["--net", "--val", "--json", "--batch", "--row-scores", "--row-probs"], ["--f32"]): usage()
+        if opt("--net", "").len == 0 or opt("--val", "").len == 0: usage()
+        tensor_cores = not has_flag("--f32")
+        start_gpu()
+        if not time_evaluate(opt("--net", ""), opt("--val", ""), opt("--json", ""), opt_int("--batch", 4096) as int, opt("--row-scores", ""), opt("--row-probs", "")): exit(1)
+    elif command == "timecheck"
+        if not options_known(["--set", "--rows"], []): usage()
+        if opt("--set", "").len == 0: usage()
+        start_gpu()
+        if not time_check(opt("--set", ""), opt_int("--rows", 64) as int): exit(1)
+    elif command == "timedump"
+        if not options_known(["--set", "--net", "--rows", "--out"], []): usage()
+        if opt("--set", "").len == 0 or opt("--net", "").len == 0 or opt("--out", "").len == 0: usage()
+        if not time_dump(opt("--set", ""), opt("--net", ""), opt_int("--rows", 1000) as int, opt("--out", "")): exit(1)
+    elif command == "eval"
+        if arg_count() < 4: usage()
+        var batch = 1024
+        var limit: i64 = 0
+        var compare_with = ""
+        var bins_path = ""
+        var stride: i64 = 1
+        tensor_cores = true
+        var i = 4
+        while i < arg_count()
+            let option = arg(i)
+            if option == "--f32"
+                tensor_cores = false
+                i += 1
+                continue
+            if option == "--no-half"
+                half_pass = false
+                i += 1
+                continue
+            if i + 1 >= arg_count(): usage()
+            if option == "--batch": batch = parse_int(arg(i + 1)) as int
+            elif option == "--limit": limit = parse_int(arg(i + 1))
+            elif option == "--compare": compare_with = arg(i + 1)
+            elif option == "--bins": bins_path = arg(i + 1)
+            elif option == "--stride": stride = max(parse_int(arg(i + 1)), 1)
+            else: usage()
+            i += 2
+        start_gpu()
+        evaluate(arg(2), arg(3), batch, limit, compare_with, bins_path, stride)
+    else
+        usage()

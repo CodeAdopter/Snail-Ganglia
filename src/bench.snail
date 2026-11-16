@@ -1,0 +1,426 @@
+# ganglia gemmcheck: the tensor-core product (gemm_bf16) against the f32 one (gemm_f32) in the
+# layouts the net uses, on inputs already rounded to bf16, so that only the order of the f32
+# additions differs; then both timed at the size of a block's first feed-forward layer.
+
+use cuda/driver
+use model
+use kernels/gemm
+use kernels/mm
+use kernels/records
+use kernels/optim
+use base/stream
+use checkpoint
+use forward
+use backward
+use train
+
+fn random_bf16_values(n: i64, seed: u64) -> *f32
+    let v = alloc[f32](n)
+    var rng = Random(state: seed)
+    for i in 0..n
+        v[i] = ((2.0 * rng.unit() - 1.0) as f32) as bf16 as f32
+    return v
+
+struct Shape
+    name: str
+    accumulate: bool = false     # run each product twice, adding to c (beta 1), as gradients do
+    m: int
+    n: int
+    k: int
+    a_row: int
+    a_col: int
+    b_row: int
+    b_col: int
+
+fn check_shape(s: Shape) -> bool
+    let a = random_bf16_values(s.m as i64 * s.k, 1)
+    let b = random_bf16_values(s.k as i64 * s.n, 2)
+    var da = device_alloc(s.m as i64 * s.k * 4)
+    var db = device_alloc(s.k as i64 * s.n * 4)
+    var c32 = device_alloc(s.m as i64 * s.n * 4)
+    var c16 = device_alloc(s.m as i64 * s.n * 4)
+    upload(da, a, s.m as i64 * s.k * 4)
+    upload(db, b, s.k as i64 * s.n * 4)
+    tensor_cores = false
+    for round in 0..(s.accumulate ? 2 : 1)
+        let beta: f32 = round == 0 ? 0.0 : 1.0
+        gemm(s.m, s.n, s.k, da, s.a_row, s.a_col, 0, db, s.b_row, s.b_col, 0, c32, s.n, 0, 1, 1.0, beta)
+        gemm_mma(s.m, s.n, s.k, da, s.a_row, s.a_col, 0, db, s.b_row, s.b_col, 0, c16, s.n, 0, 1, 1.0, beta)
+    let n = s.m as i64 * s.n
+    let x = alloc[f32](n)
+    let y = alloc[f32](n)
+    download(x, c32, n * 4)
+    download(y, c16, n * 4)
+    var d2: f64 = 0.0
+    var r2: f64 = 0.0
+    var most: f64 = 0.0
+    for i in 0..n
+        let d = y[i] as f64 - x[i] as f64
+        d2 += d * d
+        r2 += x[i] as f64 * x[i] as f64
+        most = max(most, abs(d))
+    let rel = sqrt(d2 / r2)
+    let ok = rel < 1.0e-5
+    let verdict = ok ? "ok" : "FAIL"
+    print("{s.name:-26} {s.m:6} x {s.n:5} x {s.k:5}  rms rel {rel:.2e}  max |diff| {most:.2e}  {verdict}")
+    free(a)
+    free(b)
+    free(x)
+    free(y)
+    device_free(&da)
+    device_free(&db)
+    device_free(&c32)
+    device_free(&c16)
+    return ok
+
+fn time_gemm(label: str, use_mma: bool, m: int, n: int, k: int, a: DeviceMemory, b: DeviceMemory, c: DeviceMemory)
+    var timer = gpu_timer()
+    let rounds = 10
+    for r in 0..rounds + 1
+        if r == 1: timer.start(Stream(handle: null))
+        tensor_cores = use_mma
+        gemm(m, n, k, a, k, 1, 0, b, 1, k, 0, c, n, 0, 1, 1.0)
+    let ms = timer.stop(Stream(handle: null)) / rounds as f32
+    let tflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms as f64 / 1000.0) / 1.0e12
+    print("{label:-10} {ms:8.3f} ms  {tflops:6.1f} TFLOPS")
+    timer.destroy()
+
+fn check_gemms() -> bool
+    var ok = true
+    # y = x w^T: a [m][k], b = w [n][k]
+    ok = check_shape(Shape(name: "forward", m: 1000, n: 300, k: 145, a_row: 145, a_col: 1, b_row: 1, b_col: 145)) and ok
+    # dx = dy w: a = dy [m][n'], b = w [n'][k'] read as (k = n', column k')
+    ok = check_shape(Shape(name: "input gradient", m: 777, n: 320, k: 960, a_row: 960, a_col: 1, b_row: 320, b_col: 1)) and ok
+    # dw = dy^T x: a = dy^T (dy [rows][n'], rows = k), b = x [rows][k']
+    ok = check_shape(Shape(name: "weight gradient", m: 130, n: 333, k: 4100, a_row: 1, a_col: 130, b_row: 333, b_col: 1)) and ok
+    ok = check_shape(Shape(name: "weight gradient, added", accumulate: true, m: 1024, n: 256, k: 65536, a_row: 1, a_col: 1024, b_row: 256, b_col: 1)) and ok
+    ok = check_shape(Shape(name: "both transposed", m: 200, n: 150, k: 70, a_row: 1, a_col: 200, b_row: 1, b_col: 70)) and ok
+
+    let m = 65536
+    let n = 1280
+    let k = 320
+    var a = device_alloc(m as i64 * k * 4)
+    var b = device_alloc(n as i64 * k * 4)
+    var c = device_alloc(m as i64 * n * 4)
+    let ha = random_bf16_values(m as i64 * k, 3)
+    let hb = random_bf16_values(n as i64 * k, 4)
+    upload(a, ha, m as i64 * k * 4)
+    upload(b, hb, n as i64 * k * 4)
+    print("timing {m} x {n} x {k} (a block's first feed-forward layer at batch 1024):")
+    time_gemm("f32", false, m, n, k, a, b, c)
+    time_gemm("bf16 mma", true, m, n, k, a, b, c)
+    return ok
+
+# ---- the products on bf16 operands (kernels/mm.snail) --------------------------------------------
+
+# n random values in [-1, 1) as bf16, and the same values as f32.
+fn random_halves(n: i64, seed: u64) -> (*bf16, *f32)
+    let h = alloc[bf16](n)
+    let f = alloc[f32](n)
+    var rng = Random(state: seed)
+    for i in 0..n
+        h[i] = ((2.0 * rng.unit() - 1.0) as f32) as bf16
+        f[i] = h[i] as f32
+    return h, f
+
+fn uploaded(host: *void, bytes: i64) -> DeviceMemory
+    let m = device_alloc(bytes)
+    upload(m, host, bytes)
+    return m
+
+# The relative RMS difference of n values of y from x.
+fn rms_rel(x: *f32, y: *f32, n: i64) -> f64
+    var d2: f64 = 0.0
+    var r2: f64 = 0.0
+    for i in 0..n
+        let d = y[i] as f64 - x[i] as f64
+        d2 += d * d
+        r2 += x[i] as f64 * x[i] as f64
+    return sqrt(d2 / max(r2, 1.0e-30))
+
+fn verdict(ok: bool) -> str
+    return ok ? "ok" : "FAIL"
+
+# The three layouts of mm.snail against gemm_f32 on the same values, for rows x n x k of a Linear
+# with weight [n][k]: the forward pass into f32 and into bf16, the input's gradient, and the
+# weight's gradient added to what dw held.
+fn check_mm_shape(rows: int, n: int, k: int) -> bool
+    let (x16, x32) = random_halves(rows as i64 * k, 11)
+    let (w16, w32) = random_halves(n as i64 * k, 12)
+    let (d16, d32) = random_halves(rows as i64 * n, 13)
+    let (b16, b32) = random_halves(n, 14)
+    let dx16 = uploaded(x16, rows as i64 * k * 2)
+    let dx32 = uploaded(x32, rows as i64 * k * 4)
+    let dw16 = uploaded(w16, n as i64 * k * 2)
+    let dw32 = uploaded(w32, n as i64 * k * 4)
+    let dd16 = uploaded(d16, rows as i64 * n * 2)
+    let dd32 = uploaded(d32, rows as i64 * n * 4)
+    let bias = uploaded(b32, n * 4)
+    let most = max(rows as i64 * max(n, k), n as i64 * k)
+    var want = device_alloc(most * 4)
+    var got = device_alloc(most * 4)
+    var got16 = device_alloc(most * 2)
+    let hw = alloc[f32](most)
+    let hg = alloc[f32](most)
+    tensor_cores = false
+    var ok = true
+
+    # y = x w^T + bias
+    var count = rows as i64 * n
+    gemm(rows, n, k, dx32, k, 1, 0, dw32, 1, k, 0, want, n, 0, 1, 1.0, 0.0, bias)
+    mm_linear_floats(dx16, dw16, bias, got, rows, k, n)
+    download(hw, want, count * 4)
+    download(hg, got, count * 4)
+    let forward = rms_rel(hw, hg, count)
+    mm_linear(dx16, dw16, bias, got16, rows, k, n)
+    to_floats(count, got16, got)
+    download(hg, got, count * 4)
+    let forward16 = rms_rel(hw, hg, count)
+
+    # dx = dy w
+    count = rows as i64 * k
+    gemm(rows, k, n, dd32, n, 1, 0, dw32, k, 1, 0, want, k, 0, 1, 1.0, 0.0)
+    mm_input_gradient_floats(dd16, dw16, got, rows, k, n)
+    download(hw, want, count * 4)
+    download(hg, got, count * 4)
+    let input = rms_rel(hw, hg, count)
+
+    # dw += dy^T x, twice
+    count = n as i64 * k
+    device_zero(want)
+    device_zero(got)
+    for round in 0..2
+        gemm(n, k, rows, dd32, 1, n, 0, dx32, k, 1, 0, want, k, 0, 1, 1.0, 1.0)
+        mm_weight_gradient(dd16, dx16, got, rows, k, n)
+    download(hw, want, count * 4)
+    download(hg, got, count * 4)
+    let weight = rms_rel(hw, hg, count)
+
+    let good = forward < 1.0e-5 and forward16 < 4.0e-3 and input < 1.0e-5 and weight < 1.0e-5
+    print("mm {rows:6} x {n:5} x {k:5}  forward {forward:.1e} (bf16 {forward16:.1e})  input {input:.1e}  weight {weight:.1e}  {verdict(good)}")
+    return good
+
+# Milliseconds per launch of the product named by kind, at rows x n x k, and its TFLOPS.
+fn time_mm(label: str, kind: int, rows: int, n: int, k: int)
+    let (x16, x32) = random_halves(rows as i64 * max(n, k), 21)
+    let (w16, w32) = random_halves(n as i64 * k, 22)
+    let a = uploaded(x16, rows as i64 * max(n, k) * 2)
+    let a2 = uploaded(x16, rows as i64 * max(n, k) * 2)
+    let w = uploaded(w16, n as i64 * k * 2)
+    let a32 = uploaded(x32, rows as i64 * max(n, k) * 4)
+    let w32d = uploaded(w32, n as i64 * k * 4)
+    var out = device_alloc(rows as i64 * max(n, k) * 4)
+    var out2 = device_alloc(rows as i64 * max(n, k) * 2)
+    var bias = device_alloc(max(n, k) * 4)
+    var timer = gpu_timer()
+    let rounds = 10
+    for r in 0..rounds + 1
+        if r == 1: timer.start(Stream(handle: null))
+        if kind == 0: mm_linear(a, w, bias, out, rows, k, n)
+        elif kind == 1: mm_linear_gelu(a, w, bias, out, out2, rows, k, n)
+        elif kind == 2: mm_input_gradient(a, w, out, rows, k, n)
+        elif kind == 3: mm_input_gradient_times(a, w, a2, out, bias, rows, k, n)
+        elif kind == 4: mm_weight_gradient(a, a2, out, rows, k, n)
+        elif kind == 5
+            tensor_cores = true
+            gemm(rows, n, k, a32, k, 1, 0, w32d, 1, k, 0, out, n, 0, 1, 1.0)
+    let ms = timer.stop(Stream(handle: null)) / rounds as f32
+    let tflops = 2.0 * rows as f64 * n as f64 * k as f64 / (ms as f64 / 1000.0) / 1.0e12
+    print("  {label:-34} {rows:6} x {n:5} x {k:5} {ms:8.3f} ms  {tflops:6.1f} TFLOPS")
+    timer.destroy()
+
+fn check_mm() -> bool
+    var ok = true
+    ok = check_mm_shape(1000, 304, 144) and ok
+    ok = check_mm_shape(4160, 320, 960) and ok
+    ok = check_mm_shape(777 * 8, 16, 320) and ok
+    ok = check_mm_shape(6400, 1280, 128) and ok
+    print("timing at batch 1024 (65536 rows), d 320, ffn 1280:")
+    time_mm("gemm_bf16 from f32 (before)", 5, 65536, 1280, 320)
+    time_mm("forward ff1", 0, 65536, 1280, 320)
+    time_mm("forward ff1 + gelu", 1, 65536, 1280, 320)
+    time_mm("forward ff2", 0, 65536, 320, 1280)
+    time_mm("forward qkv", 0, 65536, 960, 320)
+    time_mm("forward out", 0, 65536, 320, 320)
+    time_mm("input gradient ff1", 2, 65536, 1280, 320)
+    time_mm("input gradient ff2 * slope", 3, 65536, 320, 1280)
+    time_mm("input gradient qkv", 2, 65536, 960, 320)
+    time_mm("weight gradient ff1", 4, 65536, 1280, 320)
+    time_mm("weight gradient ff2", 4, 65536, 320, 1280)
+    time_mm("weight gradient qkv", 4, 65536, 960, 320)
+    time_mm("weight gradient out", 4, 65536, 320, 320)
+    return ok
+
+# ganglia profile: where a training step's time goes, for a net and the first batch of positions
+# in a test file. Runs two steps to warm up and times the next ten as a training run takes them;
+# then times `steps` steps part by part with the GPU waited for at each mark, so those times add
+# up to more than an unprofiled step takes.
+fn profile_training(weights: str, test: str, batch: int, steps: int)
+    var ck = load_checkpoint(weights)
+    var net = gpu_net(&ck)
+    var (mapped, ok) = map_file(test)
+    if not ok: fail2("cannot open ", test)
+    let l = net.layout
+    var p = pass_buffers(net.cfg, batch, true)
+    var g = grad_buffers(net.cfg, l.total, batch)
+    var opt = new_optimizer(l, AdamW())
+    upload(p.records, mapped.data.ptr, batch as i64 * Record)
+    let known = alloc[u8](batch)
+    draw_known(known, batch, 1, 0)
+    upload(p.known, known, batch)
+    let (results, timed_count) = loss_counts(mapped.data.ptr, known, batch)
+    var plain: f64 = 0.0
+    let timed = 10
+    for round in 0..2 + timed
+        if round == 2
+            gpu_sync()
+            plain = now_ms()
+        forward(&net, &p, batch)
+        backward(&net, &p, &g, batch, LossWeights(), results, timed_count)
+        optimizer_step(&opt, net.params, g.params, l.total, 0.0001)
+        net.halve()
+    gpu_sync()
+    let step_ms = (now_ms() - plain) / timed as f64
+    print("{weights}, batch {batch}, tensor cores {tensor_cores}, bf16 pass {p.half}: {step_ms:.1} ms per step, {batch as f64 * 1000.0 / step_ms:.0} positions/s")
+    var prof = new Profile
+    profiling = prof
+    gpu_sync()
+    prof.last = now_ms()
+    for round in 0..steps
+        forward(&net, &p, batch)
+        backward(&net, &p, &g, batch, LossWeights(), results, timed_count)
+        optimizer_step(&opt, net.params, g.params, l.total, 0.0001)
+        net.halve()
+        mark("optimizer")
+    profiling = null
+    var total: f64 = 0.0
+    for i in 0..prof.count
+        total += prof.ms[i]
+    print("profiled: {total / steps as f64:.1} ms per step")
+    for k in 0..prof.count
+        var best = -1
+        for i in 0..prof.count
+            if prof.ms[i] >= 0.0 and (best < 0 or prof.ms[i] > prof.ms[best]): best = i
+        let name = prof.names[best]
+        print("  {name:-28} {prof.ms[best] / steps as f64:8.2f} ms  {100.0 * prof.ms[best] / total:5.1f}%")
+        prof.ms[best] = -1.0
+
+# ---- the bf16 pass against the f32 pass ----------------------------------------------------------
+
+# One pass's results on the host: the losses, the policy logits and every parameter's gradient.
+struct PassResult
+    losses: Losses
+    policy: *f32
+    grads: *f32
+
+# Runs the forward and backward pass as tensor_cores and half_pass say, on count positions.
+fn pass_result(ck: *Checkpoint, records: *u8, known: *u8, count: int) -> PassResult
+    var net = gpu_net(ck)
+    let l = net.layout
+    var p = pass_buffers(net.cfg, count, true)
+    var g = grad_buffers(net.cfg, l.total, count)
+    upload(p.records, records, count as i64 * Record)
+    upload(p.known, known, count)
+    let (results, timed_count) = loss_counts(records, known, count)
+    var r: PassResult
+    forward(&net, &p, count)
+    r.losses = backward(&net, &p, &g, count, LossWeights(), results, timed_count)
+    r.policy = alloc[f32](count as i64 * Classes)
+    r.grads = alloc[f32](l.total)
+    download(r.policy, p.out.policy, count as i64 * Classes * 4)
+    download(r.grads, g.params, l.total * 4)
+    return r
+
+# How far b's gradient is from a's: the relative RMS difference and the cosine over all values,
+# and the tensors with the lowest cosines.
+fn compare_grads(label: str, l: *Layout, a: *f32, b: *f32, show: int) -> f64
+    var dot: f64 = 0.0
+    var a2: f64 = 0.0
+    var b2: f64 = 0.0
+    var d2: f64 = 0.0
+    let cosines = alloc[f64](l.params.len)
+    let rels = alloc[f64](l.params.len)
+    for t in 0..l.params.len
+        let p = &l.params[t]
+        var td: f64 = 0.0
+        var ta: f64 = 0.0
+        var tb: f64 = 0.0
+        var tdiff: f64 = 0.0
+        for i in p.at..p.at + p.count
+            let x = a[i] as f64
+            let y = b[i] as f64
+            td += x * y
+            ta += x * x
+            tb += y * y
+            tdiff += (x - y) * (x - y)
+        dot += td
+        a2 += ta
+        b2 += tb
+        d2 += tdiff
+        cosines[t] = ta > 0.0 and tb > 0.0 ? td / sqrt(ta * tb) : (ta == tb ? 1.0 : 0.0)
+        rels[t] = ta > 0.0 ? sqrt(tdiff / ta) : sqrt(tdiff)
+    let cosine = dot / sqrt(a2 * b2)
+    print("{label}: gradient rms rel {sqrt(d2 / a2):.2e}, cosine {cosine:.6f}, norm {sqrt(b2):.5f} against {sqrt(a2):.5f}")
+    for k in 0..min(show, l.params.len)
+        var worst = -1
+        for t in 0..l.params.len
+            if cosines[t] <= 1.5 and (worst < 0 or cosines[t] < cosines[worst]): worst = t
+        let name = l.params[worst].name
+        print("    {name:-34} cosine {cosines[worst]:.6f}  rms rel {rels[worst]:.2e}  ({l.params[worst].count} values)")
+        cosines[worst] = 2.0
+    free(cosines)
+    free(rels)
+    return cosine
+
+# ganglia halfcheck: the losses, the policy and the gradients of the bf16 pass against the f32
+# pass's on the first count positions of a test file, beside those of the f32 pass with its
+# products on the tensor cores (gemm_bf16), whose rounding is of the same kind.
+fn check_half(weights: str, test: str, count: int) -> bool
+    var ck = load_checkpoint(weights)
+    var (mapped, ok) = map_file(test)
+    if not ok: fail2("cannot open ", test)
+    let records = mapped.data.ptr
+    let known = alloc[u8](count)
+    draw_known(known, count, 1, 0)
+    let l = layout_of(ck.cfg)
+    tensor_cores = false
+    let exact = pass_result(&ck, records, known, count)
+    tensor_cores = true
+    half_pass = false
+    let mixed = pass_result(&ck, records, known, count)
+    half_pass = true
+    let half = pass_result(&ck, records, known, count)
+    let names = ["f32", "f32 with bf16 products", "bf16 pass"]
+    let all = [exact, mixed, half]
+    for i in 0..3
+        let r = all[i].losses
+        let name = names[i]
+        print("{name:-24} policy {r.policy:.6f}  value {r.value:.6f}  time {r.time:.6f}  salience {r.salience:.5f}")
+    let n = count as i64 * Classes
+    print("policy logits against f32: bf16 products rms rel {rms_rel(exact.policy, mixed.policy, n):.2e}, bf16 pass {rms_rel(exact.policy, half.policy, n):.2e}")
+    compare_grads("f32 with bf16 products", l, exact.grads, mixed.grads, 4)
+    let cosine = compare_grads("bf16 pass", l, exact.grads, half.grads, 12)
+    let fine = cosine > 0.99 and abs(half.losses.policy - exact.losses.policy) < 0.01
+    print("{verdict(fine)}")
+    return fine
+
+# ganglia initcheck: a new net's parameters for a seed (init_params) against a checkpoint of the
+# net PyTorch starts for that seed (weights/gnets/checks/torch-init-v1-seed1.gnet is seed 1's).
+fn check_init(weights: str, seed: int) -> bool
+    var ck = load_checkpoint(weights)
+    let l = layout_of(ck.cfg)
+    let ours = init_params(l, seed as u64)
+    var same: i64 = 0
+    var most: f64 = 0.0
+    var worst = ""
+    for t in 0..l.params.len
+        let p = &l.params[t]
+        for i in p.at..p.at + p.count
+            if ours[i].bits == ck.params[i].bits: same += 1
+            let diff = abs(ours[i] as f64 - ck.params[i] as f64)
+            if diff > most
+                most = diff
+                worst = p.name
+    let fine = most < 1.0e-6
+    print("{weights}, seed {seed}: {same} of {l.total} values have PyTorch's bits ({100.0 * same as f64 / l.total as f64:.3}%), largest difference {most:.2e} ({worst})  {verdict(fine)}")
+    return fine

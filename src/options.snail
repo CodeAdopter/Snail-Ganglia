@@ -1,0 +1,42 @@
+# Options on the command line, for the commands that take them by name after the command:
+#
+#   ganglia <command> --name value ... --flag ...
+
+# The value after option name, or fallback when the option is not given.
+fn opt(name: str, fallback: str) -> str
+    var i = 2
+    while i + 1 < arg_count()
+        if arg(i) == name: return arg(i + 1)
+        i += 1
+    return fallback
+
+fn opt_int(name: str, fallback: i64) -> i64
+    let v = opt(name, "")
+    return v.len > 0 ? parse_int(v) : fallback
+
+fn opt_float(name: str, fallback: f64) -> f64
+    let v = opt(name, "")
+    return v.len > 0 ? parse_float(v) : fallback
+
+# Whether flag, an option without a value, is given.
+fn has_flag(name: str) -> bool
+    for i in 2..arg_count()
+        if arg(i) == name: return true
+    return false
+
+# Whether every argument from the third on is one of the options named in valued, followed by its
+# value, or one of flags. Prints the first that is not.
+fn options_known(valued: []str, flags: []str) -> bool
+    var i = 2
+    while i < arg_count()
+        let a = arg(i)
+        var step = 0
+        for f in flags
+            if a == f: step = 1
+        for v in valued
+            if a == v and i + 1 < arg_count(): step = 2
+        if step == 0
+            print("unknown option, or an option without its value: {a}")
+            return false
+        i += step
+    return true

@@ -1,0 +1,305 @@
+# ganglia train: trains a net on positions streamed from positions.exe, as train.py's train()
+# does. AdamW with betas 0.9 and 0.95 and weight decay on the 2-D weights; the gradient's norm
+# clipped to 1; the learning rate warmed up over min(1000, steps / 10) steps and then cosine-
+# decayed to 5% of its peak; the think time given to a random half of each batch. Every
+# eval_every steps, a quick evaluation on every 10th test position saves last.gnet, and best.gnet
+# when its blitz top-1 is the best so far; its results per rating bin go to the run's evals.tsv.
+#
+# Three options are not train.py's. --bullet 1 trains on bullet games too, and gives a new net
+# rating and clock tables for bullet. --records trains on a file of positions (positions.exe's
+# output, kept) read in order, so that runs to be compared see the same positions. --cond says
+# which norms a new net's condition reaches, for measuring what conditioning every block is worth.
+
+use cuda/driver
+use base/sys
+use base/paths
+use base/stream
+use model
+use checkpoint
+use forward
+use backward
+use evaluation
+use kernels/records
+use kernels/gemm
+use kernels/heads
+use kernels/optim
+
+struct TrainSettings
+    run: str = ""
+    games: str = ""
+    records: str = ""            # a file of training positions, in place of positions.exe's stream
+    val: str = ""
+    positions_exe: str = ""
+    positions: f64 = 100000000.0
+    batch: int = 1024
+    lr: f64 = 0.001
+    wd: f32 = 0.01
+    width: int = 256
+    layers: int = 8
+    heads: int = 8
+    smolgen: bool = false
+    bullet: bool = false         # bullet games in the stream, and bullet's own tables in a new net
+    cond: str = "all"            # the norms a new net's condition reaches: all, ends or input
+    w_value: f32 = 0.1
+    w_time: f32 = 0.1
+    w_sal: f32 = 0.1
+    p: f64 = 0.2
+    cap: f64 = 2000.0
+    seed: int = 1
+    init_seed: int = -1          # the new net's initial weights; -1 for seed
+    log_every: int = 200
+    eval_every: int = 5000
+    resume: str = ""
+    init: str = ""
+    cutoff: str = ""
+    stop_at: int = 0
+    stall_seconds: int = 300     # how long without a step before the run gives up on the GPU; 0 to wait forever
+    trace_from: int = -1         # the step from which every part of a step is waited for and named
+
+# Lines printed and appended to the run's log.txt.
+struct Log
+    file: File
+
+    fn say(text: str)
+        print("{text}")
+        file.write(text as []u8)
+        file.write("\n" as []u8)
+
+# Watches a training run from a thread of its own (watch_run), and ends the program when no step
+# finishes for stall_seconds: a kernel that never returns leaves the run waiting for the GPU
+# forever, with nothing printed. The run then continues from its last checkpoint with --resume.
+struct Watch
+    @volatile
+    beat: i64                   # counts up whenever the run moves on
+    @volatile
+    done: bool
+    @volatile
+    stalled: bool               # set before the watch ends the program
+    stall_seconds: int
+    data: *Process              # positions.exe, stopped before the program ends; null without it
+
+fn watch_run(w: *Watch)
+    var seen: i64 = -1
+    var since = now_ms()
+    while not w.done
+        sleep_ms(500)
+        if w.beat != seen
+            seen = w.beat
+            since = now_ms()
+        elif now_ms() - since > w.stall_seconds as f64 * 1000.0
+            print("no step finished in {w.stall_seconds} s: the GPU or positions.exe has stopped answering. Ending the run; --resume its last.gnet to continue it.")
+            w.stalled = true
+            if w.data != null: w.data.stop()
+            quit(3)
+
+fn make_dirs(path: str)
+    if path.len == 0 or dir_exists(path): return
+    make_dirs(directory_name(path))
+    make_dir(path)
+
+# train.py's lr_at: a linear warmup, then a cosine from the peak down to 5% of it.
+fn lr_at(peak: f64, step: i64, steps: i64, warmup: i64) -> f64
+    if step < warmup: return peak * (step + 1) as f64 / warmup as f64
+    let t = (step - warmup) as f64 / max(steps - warmup, 1) as f64
+    return peak * (0.05 + 0.95 * 0.5 * (1.0 + cos(3.141592653589793 * t)))
+
+# The positions in the batch that are given their think time: each with probability 1/2, from a
+# generator seeded by the run's seed and the step, so a resumed run draws the same.
+fn draw_known(known: *u8, count: int, seed: int, step: i64)
+    var rng = Random(state: wrapping_mul(seed as u64 + 1, 0x9E3779B97F4A7C15) ^ step as u64)
+    for i in 0..count
+        known[i] = (rng.next() >> 63) as u8
+
+# The parameters, first and second moments and blitz top-1 on the GPU, saved as path.
+fn save_run(path: str, net: *GpuNet, opt: *Optimizer, step: i64, metric: f64, host: *f32) -> bool
+    let n = net.layout.total
+    download(host, net.params, n * 4)
+    download(host + n, opt.m, n * 4)
+    download(host + 2 * n, opt.v, n * 4)
+    return save_checkpoint(path, net.cfg, step, n, host, host + n, host + 2 * n, opt.steps, metric)
+
+# The parameters --cond keeps at zero in a new net: the weights that turn the condition into a
+# norm's scales, shifts and gates, for every block after the first (ends), and for the final norm
+# too (input). Those norms keep their biases, a scale, shift and gate that no longer depend on the
+# position's condition. Returns each tensor's offset and size.
+fn unconditioned(l: *Layout, cond: str) -> ([..]i64, [..]i64)
+    var at: [..]i64
+    var count: [..]i64
+    if cond == "all": return at, count
+    let d = l.cfg.d as i64
+    let dc = l.cfg.dc as i64
+    for i in 1..l.cfg.layers
+        at.push(l.blocks[i].ada_w)
+        count.push(6 * d * dc)
+    if cond == "input"
+        at.push(l.final_w)
+        count.push(2 * d * dc)
+    return at, count
+
+fn text_of(v: f64) -> str
+    var buffer: [64]u8
+    return kept(format(&buffer, "{v:g}"))
+
+fn int_of(v: i64) -> str
+    var buffer: [32]u8
+    return kept(format(&buffer, "{v}"))
+
+fn train(s: *TrainSettings) -> bool
+    make_dirs(s.run)
+    var (log_file, logging) = append_file(combine(s.run, "log.txt"))
+    if not logging: fail2("cannot write the log in ", s.run)
+    var log = Log(file: log_file)
+    var buffer: [2048]u8
+
+    # The net: new, with --init's weights, or with --resume's weights and optimizer.
+    var cfg = Config(d: s.width, layers: s.layers, heads: s.heads, ffn: 4 * s.width, dc: 128, dp: 128, smolgen: s.smolgen, bullet_tables: s.bullet)
+    var ck: Checkpoint
+    let from = s.resume.len > 0 ? s.resume : s.init
+    if from.len > 0
+        ck = load_checkpoint(from)
+        cfg = ck.cfg
+    let l = layout_of(cfg)
+    let params = from.len > 0 ? ck.params : init_params(l, (s.init_seed >= 0 ? s.init_seed : s.seed) as u64)
+    var net = new_gpu_net(cfg, l, params)
+
+    var opt = new_optimizer(l, AdamW(weight_decay: s.wd))
+
+    let steps = (s.positions / s.batch as f64) as i64
+    let warmup = min(1000, steps / 10)
+    var first: i64 = 0
+    var rewarm: i64 = 0
+    var best: f64 = 0.0
+    let source = s.records.len > 0 ? s.records : s.games
+    log.say(format(&buffer, "params {l.total as f64 / 1.0e6:.2}M  d {cfg.d}, {cfg.layers} layers, {cfg.heads} heads, smolgen {cfg.smolgen}, bullet tables {cfg.bullet_tables}, cond {s.cond}  batch {s.batch}, {steps} steps, lr {s.lr:g}, seed {s.seed}  w value {s.w_value:g} time {s.w_time:g} sal {s.w_sal:g}  positions {source}  val {s.val}  run {s.run}"))
+    if s.resume.len > 0
+        first = ck.step
+        best = ck.metric
+        if ck.adam_steps > 0
+            upload(opt.m, ck.exp_avg, l.total * 4)
+            upload(opt.v, ck.exp_avg_sq, l.total * 4)
+            opt.steps = ck.adam_steps
+            log.say(format(&buffer, "resumed from {s.resume} at step {first}"))
+        else
+            rewarm = 500
+            log.say(format(&buffer, "resumed from {s.resume} at step {first}, optimizer state fresh, lr re-warmed over 500 steps"))
+    elif s.init.len > 0
+        log.say(format(&buffer, "starting from the weights of {s.init} (its step {ck.step}); new schedule over {steps} steps, fresh optimizer"))
+
+    let batch = s.batch
+    let bytes = batch as i64 * Record
+    # Training positions: a file's, batch after batch and again from its start when it ends, or
+    # positions.exe's stream, seeded so a resumed run continues the stream anew.
+    let from_file = s.records.len > 0
+    var data: Process
+    var file_records: *u8 = null
+    var file_batches: i64 = 0
+    if from_file
+        var (mapped, mapped_ok) = map_file(s.records)
+        if not mapped_ok: fail2("cannot open ", s.records)
+        file_records = mapped.data.ptr
+        file_batches = mapped.data.len / bytes
+        if file_batches == 0: fail2("fewer positions than a batch in ", s.records)
+    else
+        var args: [..]str
+        args.push(s.games)
+        args.push("train")
+        args.push("--seed")
+        args.push(int_of(s.seed as i64 + first))
+        args.push("--p")
+        args.push(text_of(s.p))
+        args.push("--cap")
+        args.push(text_of(s.cap))
+        if s.cutoff.len > 0
+            args.push("--cutoff")
+            args.push(s.cutoff)
+        if s.bullet
+            args.push("--bullet")
+            args.push("1")
+        var (stream, started) = start_process(s.positions_exe, args)
+        if not started: fail2("cannot start ", s.positions_exe)
+        data = stream
+    var (val_file, val_ok) = map_file(s.val)
+    if not val_ok: fail2("cannot open ", s.val)
+    let (fixed_at, fixed_count) = unconditioned(l, s.cond)
+    var p = pass_buffers(cfg, batch, true)
+    var g = grad_buffers(cfg, l.total, batch)
+    let w = LossWeights(value: s.w_value, time: s.w_time, salience: s.w_sal)
+    let staging = pinned_alloc(bytes)
+    var records = staging
+    let known = alloc[u8](batch)
+    var best_dev = device_alloc(batch * 4)
+    var top3_dev = device_alloc(batch)
+    var loss_dev = device_alloc(batch * 4)
+    let host_best = alloc[i32](batch)
+    let saved = alloc[f32](3 * l.total)
+    var sums: [5]f64
+    var seen: i64 = 0
+    let start = now_ms()
+    var step = first
+    let watch = new Watch
+    watch.stall_seconds = s.stall_seconds
+    watch.data = from_file ? null : &data
+    if s.stall_seconds > 0: spawn(watch_run, watch)
+    while step < steps
+        if from_file
+            records = file_records + (step % file_batches) * bytes
+        elif data.output.read(staging[0..bytes]) != bytes
+            # The watch closes the stream when it ends the run.
+            if watch.stalled: quit(3)
+            fail2("positions.exe ended: ", s.positions_exe)
+        watch.beat += 1
+        upload(p.records, records, bytes)
+        draw_known(known, batch, s.seed, step)
+        upload(p.known, known, batch)
+        var lr = lr_at(s.lr, step, steps, warmup)
+        let logged_lr = lr
+        if rewarm > 0: lr *= min(1.0, (step - first + 1) as f64 / rewarm as f64)
+
+        if s.trace_from >= 0 and step >= s.trace_from
+            tracing = true
+            print("step {step}")
+        forward(&net, &p, batch)
+        let (results, timed_count) = loss_counts(records, known, batch)
+        let losses = backward(&net, &p, &g, batch, w, results, timed_count)
+        run_score_moves(batch, p.records, p.out.policy, best_dev, top3_dev, loss_dev)
+        for i in 0..fixed_at.len
+            device_fill32(floats(g.params, fixed_at[i]), 0, fixed_count[i])
+        optimizer_step(&opt, net.params, g.params, l.total, lr as f32)
+        net.halve()
+        download(host_best, best_dev, batch * 4)
+        var hits = 0
+        for i in 0..batch
+            if host_best[i] == rec_u16(records + i * Record, AtTarget): hits += 1
+        sums[0] += losses.policy
+        sums[1] += losses.value
+        sums[2] += losses.time
+        sums[3] += losses.salience
+        sums[4] += hits as f64 / batch as f64
+        seen += batch
+        step += 1
+        watch.beat += 1
+
+        if step % s.log_every == 0
+            let n = s.log_every as f64
+            let rate = seen as f64 / ((now_ms() - start) / 1000.0)
+            log.say(format(&buffer, "step {step}/{steps}  pos {seen as f64 / 1.0e6:.1}M  {rate:.0} pos/s  lr {logged_lr:.2e}  policy {sums[0] / n:.4}  value {sums[1] / n:.4}  time {sums[2] / n:.4}  sal {sums[3] / n:.3}  train top1 {100.0 * sums[4] / n:.2}%"))
+            for i in 0..5
+                sums[i] = 0.0
+        if step % s.eval_every == 0 or step == steps
+            let t = score(&net, &p, val_file.data, 10, 0, null, &watch.beat)
+            log.say(format(&buffer, "eval step {step}  {summary(t)}"))
+            if not append_bins(combine(s.run, "evals.tsv"), step, t): fail2("cannot write evals.tsv in ", s.run)
+            let top1 = speed_result(t, 2).top1
+            if not save_run(combine(s.run, "last.gnet"), &net, &opt, step, top1, saved): fail2("cannot save in ", s.run)
+            if top1 > best
+                best = top1
+                if not save_run(combine(s.run, "best.gnet"), &net, &opt, step, top1, saved): fail2("cannot save in ", s.run)
+            if s.stop_at > 0 and step >= s.stop_at
+                log.say(format(&buffer, "stopped at step {step} (--stop-at), {(now_ms() - start) / 3600000.0:.2} h"))
+                watch.done = true
+                if not from_file: data.stop()
+                return true
+    log.say(format(&buffer, "done in {(now_ms() - start) / 3600000.0:.2} h"))
+    watch.done = true
+    if not from_file: data.stop()
+    return true

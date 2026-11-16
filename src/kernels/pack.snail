@@ -1,0 +1,125 @@
+# Linears that run as one product (model.snail's LinearGroup): their parameters copied into
+# packed weights and biases, their gradients sent back to the tensors they came from, and columns
+# moved between the group's wide output and a member's own matrix.
+
+use cuda/driver
+use kernels/gemm
+use kernels/layers
+use kernels/mm
+
+# out[i] = params[from[i]] as bf16, and 0 where from[i] is negative.
+@kernel
+fn gather_halves(n: i64, params: *f32, from: *i32, out: *bf16)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i >= n: return
+    let at = from[i]
+    var v: f32 = 0.0
+    if at >= 0: v = params[at]
+    out[i] = v as bf16
+
+@kernel
+fn gather_floats(n: i64, params: *f32, from: *i32, out: *f32)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i >= n: return
+    let at = from[i]
+    var v: f32 = 0.0
+    if at >= 0: v = params[at]
+    out[i] = v
+
+# to[from[i]] += values[i] where from[i] is not negative. No two i have the same from.
+@kernel
+fn scatter_add(n: i64, values: *f32, from: *i32, to: *f32)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i >= n: return
+    let at = from[i]
+    if at >= 0: to[at] += values[i]
+
+# split_sum (gemm.snail) into scattered places: to[from[i]] += the sum over the splits of
+# partial[z][i], for the count values of a group's weights, in the order of z.
+@kernel
+fn split_sum_scatter(count: i64, splits: int, partial: *f32, from: *i32, to: *f32)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i >= count: return
+    let at = from[i]
+    if at < 0: return
+    var s: f32 = 0.0
+    for z in 0..splits
+        s += partial[z as i64 * count + i]
+    to[at] += s
+
+# narrow [rows][width] = the columns from first of wide [rows][stride], and the other way.
+@kernel
+fn take_columns(rows: int, stride: int, first: int, width: int, wide: *f32, narrow: *f32)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i >= rows as i64 * width: return
+    let r = i / width
+    narrow[i] = wide[r * stride + first + (i - r * width)]
+
+@kernel
+fn put_columns(rows: int, stride: int, first: int, width: int, narrow: *f32, wide: *f32)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i >= rows as i64 * width: return
+    let r = i / width
+    wide[r * stride + first + (i - r * width)] = narrow[i]
+
+@kernel
+fn take_half_columns(rows: int, stride: int, first: int, width: int, wide: *bf16, narrow: *bf16)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i >= rows as i64 * width: return
+    let r = i / width
+    narrow[i] = wide[r * stride + first + (i - r * width)]
+
+@kernel
+fn put_half_columns(rows: int, stride: int, first: int, width: int, narrow: *bf16, wide: *bf16)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i >= rows as i64 * width: return
+    let r = i / width
+    wide[r * stride + first + (i - r * width)] = narrow[i]
+
+fn run_gather_halves(n: i64, params: DeviceMemory, from: DeviceMemory, out: DeviceMemory)
+    launch(&kernels, blocks_for(n, 256), 256, 0, gpu_args(gather_halves, n, params, from, out))
+
+fn run_gather_floats(n: i64, params: DeviceMemory, from: DeviceMemory, out: DeviceMemory)
+    launch(&kernels, blocks_for(n, 256), 256, 0, gpu_args(gather_floats, n, params, from, out))
+
+fn run_scatter_add(n: i64, values: DeviceMemory, from: DeviceMemory, to: DeviceMemory)
+    launch(&kernels, blocks_for(n, 256), 256, 0, gpu_args(scatter_add, n, values, from, to))
+
+fn run_take_columns(rows: int, stride: int, first: int, width: int, wide: DeviceMemory, narrow: DeviceMemory)
+    launch(&kernels, blocks_for(rows as i64 * width, 256), 256, 0, gpu_args(take_columns, rows, stride, first, width, wide, narrow))
+
+fn run_put_columns(rows: int, stride: int, first: int, width: int, narrow: DeviceMemory, wide: DeviceMemory)
+    launch(&kernels, blocks_for(rows as i64 * width, 256), 256, 0, gpu_args(put_columns, rows, stride, first, width, narrow, wide))
+
+fn run_take_half_columns(rows: int, stride: int, first: int, width: int, wide: DeviceMemory, narrow: DeviceMemory)
+    launch(&kernels, blocks_for(rows as i64 * width, 256), 256, 0, gpu_args(take_half_columns, rows, stride, first, width, wide, narrow))
+
+fn run_put_half_columns(rows: int, stride: int, first: int, width: int, narrow: DeviceMemory, wide: DeviceMemory)
+    launch(&kernels, blocks_for(rows as i64 * width, 256), 256, 0, gpu_args(put_half_columns, rows, stride, first, width, narrow, wide))
+
+# The gradient of a group's weights: to[from[i]] += (dy^T x)[i] for dy [rows][n] and x [rows][k]
+# bf16, with from the group's part of the net's packed_from.
+fn mm_group_weight_gradient(dy: DeviceMemory, x: DeviceMemory, from: DeviceMemory, to: DeviceMemory, rows: int, k: int, n: int)
+    let per = mm_rows_per_piece(rows, mm_grid_x(k) * mm_grid_y(n))
+    let pieces = (rows + per - 1) / per
+    let count = n as i64 * k
+    if split_scratch.bytes < pieces * count * 4
+        device_free(&split_scratch)
+        split_scratch = device_alloc(pieces * count * 4)
+    launch_on(&kernels, Stream(handle: null), mm_grid_x(k), mm_grid_y(n), pieces, 256, 1, 1, mm_shared_bytes(),
+        gpu_args(mm_weight_partial, n, k, rows, dy, n, x, k, split_scratch, none(), none(), k, none(), 1.0, 1.0, per))
+    launch(&kernels, blocks_for(count, 256), 256, 0, gpu_args(split_sum_scatter, count, pieces, split_scratch, from, to))
+
+# dx [rows][k] f32 = dy [rows][n] w, as mm_input_gradient_floats, for a long n and few rows (the
+# condition's gradient from every block's): the sum over n is split into pieces as a weight's
+# gradient's is.
+fn mm_input_gradient_split(dy: DeviceMemory, w: DeviceMemory, dx: DeviceMemory, rows: int, k: int, n: int)
+    let per = mm_rows_per_piece(n, mm_grid_x(k) * mm_grid_y(rows))
+    let pieces = (n + per - 1) / per
+    let count = rows as i64 * k
+    if split_scratch.bytes < pieces * count * 4
+        device_free(&split_scratch)
+        split_scratch = device_alloc(pieces * count * 4)
+    launch_on(&kernels, Stream(handle: null), mm_grid_x(k), mm_grid_y(rows), pieces, 256, 1, 1, mm_shared_bytes(),
+        gpu_args(mm_input_partial, rows, k, n, dy, n, w, k, split_scratch, none(), none(), k, none(), 1.0, 0.0, per))
+    launch(&kernels, blocks_for(count, 256), 256, 0, gpu_args(split_sum, rows, k, pieces, split_scratch, dx, k, none(), 1.0, 0.0))

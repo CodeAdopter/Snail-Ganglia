@@ -1,0 +1,370 @@
+# The net's forward pass on the GPU, in f32 (net.Net.forward in the Python project).
+
+use cuda/driver
+use model
+use checkpoint
+use kernels/gemm
+use kernels/layers
+use kernels/stream
+use kernels/pack
+use kernels/inputs
+use kernels/heads
+
+# Whether eval and train run the blocks in the bf16 pass (half.snail) when they multiply on the
+# tensor cores; --no-half keeps the f32 pass with gemm_bf16.
+var half_pass = true
+
+# The bf16 pass handles heads 32 wide, whose attention has kernels for the tensor cores, and rows
+# of whole 16-byte pieces.
+fn use_half(cfg: Config) -> bool
+    return tensor_cores and half_pass and cfg.d == cfg.heads * Head and cfg.ffn % 8 == 0 and cfg.d <= 256 * StreamChunks
+
+# A net whose parameters are on the GPU, in model.snail's layout.
+struct GpuNet
+    cfg: Config
+    layout: *Layout
+    params: DeviceMemory
+    half: DeviceMemory          # the parameters as bf16, for the bf16 pass: tensor t at its at16
+    shift: DeviceMemory         # [total] u16: at16 - at of each parameter's tensor
+    packed: DeviceMemory        # the groups' weights as bf16, and their biases as f32 (LinearGroup)
+    packed_bias: DeviceMemory
+    packed_from: DeviceMemory   # the layout's packed_from and bias_from, i32
+    bias_from: DeviceMemory
+
+    fn w(at: i64) -> DeviceMemory
+        return floats(params, at)
+
+    # The bf16 copy of the tensor at float offset at.
+    fn h(at: i64) -> DeviceMemory
+        return half.at(layout.half_at(at) * 2)
+
+    # A group's weights [n][k] bf16 and biases [n] f32, and where their gradients go.
+    fn group_w(g: LinearGroup) -> DeviceMemory
+        return packed.at(g.at * 2)
+
+    fn group_b(g: LinearGroup) -> DeviceMemory
+        return packed_bias.at(g.bias_at * 4)
+
+    fn group_from(g: LinearGroup) -> DeviceMemory
+        return packed_from.at(g.at * 4)
+
+    fn group_bias_from(g: LinearGroup) -> DeviceMemory
+        return bias_from.at(g.bias_at * 4)
+
+    # Brings the bf16 copies up to date with the parameters, after they are loaded or stepped.
+    fn halve()
+        if half.ptr == 0: return
+        let n = layout.total
+        launch(&kernels, blocks_for(n, 256), 256, 0, gpu_args(halve_params, n, params, shift, half))
+        run_gather_halves(layout.packed_from.len, params, packed_from, packed)
+        run_gather_floats(layout.bias_from.len, params, bias_from, packed_bias)
+
+# The net of layout l on the GPU with the parameters at host, and their bf16 copy when the bf16
+# pass will run it.
+fn new_gpu_net(cfg: Config, l: *Layout, host: *f32) -> GpuNet
+    var net = GpuNet(cfg: cfg, layout: l, params: device_alloc(l.total * 4))
+    upload(net.params, host, l.total * 4)
+    if use_half(cfg)
+        net.half = device_alloc(l.total16 * 2)
+        let shift = alloc[u16](l.total)
+        for t in 0..l.params.len
+            let p = &l.params[t]
+            for i in p.at..p.at + p.count
+                shift[i] = (p.at16 - p.at) as u16
+        net.shift = device_alloc(l.total * 2)
+        upload(net.shift, shift, l.total * 2)
+        free(shift)
+        net.packed = device_alloc(l.packed_from.len * 2)
+        net.packed_bias = device_alloc(l.bias_from.len * 4)
+        net.packed_from = device_alloc(l.packed_from.len * 4)
+        net.bias_from = device_alloc(l.bias_from.len * 4)
+        upload(net.packed_from, l.packed_from.ptr, l.packed_from.len * 4)
+        upload(net.bias_from, l.bias_from.ptr, l.bias_from.len * 4)
+        net.halve()
+    return net
+
+fn gpu_net(ck: *Checkpoint) -> GpuNet
+    return new_gpu_net(ck.cfg, layout_of(ck.cfg), ck.params)
+
+# What one block computes on the way, everything its backward pass needs.
+struct BlockActs
+    ada: DeviceMemory           # [batch][6 d] the condition's s1, b1, g1, s2, b2, g2
+    y1: DeviceMemory            # [rows][d] the input normed and modulated
+    qkv: DeviceMemory           # [rows][3 d]
+    att: DeviceMemory           # [rows][d] attention's output
+    o: DeviceMemory             # [rows][d] after the output projection
+    x_mid: DeviceMemory         # [rows][d] the stream after attention
+    y2: DeviceMemory            # [rows][d]
+    h: DeviceMemory             # [rows][ffn] before GELU
+    a: DeviceMemory             # [rows][ffn] after GELU
+    f: DeviceMemory             # [rows][d] the feed-forward's output
+    sg_comp: DeviceMemory       # [batch][64 * SmolCompress]
+    sg_h0: DeviceMemory         # [batch][SmolHidden] before SiLU, after it, after the layer norm
+    sg_h1: DeviceMemory
+    sg_h2: DeviceMemory
+    sg_z0: DeviceMemory         # [batch][heads][SmolCode] the same for the codes
+    sg_z1: DeviceMemory
+    sg_z2: DeviceMemory
+    sg_bias: DeviceMemory       # [batch][heads][64][64]
+
+# What one block computes on the way in the bf16 pass (half.snail): bf16 unless noted.
+struct HalfActs
+    y1: DeviceMemory            # [rows][d] the input normed and modulated
+    qkv: DeviceMemory           # [rows][3 d], and with smolgen its compressed squares after them
+    probs: DeviceMemory         # [batch][heads][64][64] attention's softmax
+    att: DeviceMemory           # [rows][d] attention's output
+    o: DeviceMemory             # [rows][d] after the output projection
+    y2: DeviceMemory            # [rows][d]
+    a: DeviceMemory             # [rows][ffn] after GELU
+    slope: DeviceMemory         # [rows][ffn] GELU's derivative there
+    f: DeviceMemory             # [rows][d] the feed-forward's output
+    sg_comp: DeviceMemory       # [batch][64 * SmolCompress]
+    sg_h0: DeviceMemory         # [batch][SmolHidden] f32 before SiLU, and after it
+    sg_h1: DeviceMemory
+    sg_h2: DeviceMemory         # the same after the layer norm
+    sg_z0: DeviceMemory         # [batch][heads][SmolCode] f32 before SiLU, and after it
+    sg_z1: DeviceMemory
+    sg_z2: DeviceMemory         # the same after the layer norm
+
+# What the condition and the heads compute on the way.
+struct OuterActs
+    c0: DeviceMemory            # [batch][dc] the condition's inputs
+    c1: DeviceMemory            # [batch][dc] its MLP's hidden layer before SiLU, and after it
+    c1s: DeviceMemory
+    c: DeviceMemory             # [batch][dc] the condition vector
+    ada: DeviceMemory           # [batch][2 d] the final norm's scale and shift
+    y: DeviceMemory             # [rows][d] the final tokens, normed and modulated
+    q: DeviceMemory             # [rows][dp]
+    k: DeviceMemory
+    under: DeviceMemory         # [rows][3]
+    vflat: DeviceMemory         # [batch][64 * HeadTokens], the value head's input
+    vh0: DeviceMemory           # [batch][HeadHidden] before SiLU, and after
+    vh1: DeviceMemory
+    tflat: DeviceMemory         # the same for the time head
+    th0: DeviceMemory
+    th1: DeviceMemory
+    policy: DeviceMemory        # [batch][Classes]
+    value: DeviceMemory         # [batch][3]
+    time: DeviceMemory          # [batch][TimeBins]
+    salience: DeviceMemory      # [batch][64]
+
+# The buffers of a forward pass of up to batch positions. A pass for training keeps the stream at
+# every block's input (xs[l]) and after the last block (xs[layers]), from which the backward pass
+# recomputes each block; one for evaluation alternates between two.
+struct Pass
+    batch: int
+    training: bool
+    half: bool                  # the blocks run in the bf16 pass
+    records: DeviceMemory       # [batch][Record]
+    known: DeviceMemory         # [batch] u8: 1 when the position is given its think time
+    features: DeviceMemory      # [rows][Inputs]
+    xs: [..]DeviceMemory        # [rows][d] each
+    blk: BlockActs
+    out: OuterActs
+    # The bf16 pass: every block's values when training, since its backward pass reads them
+    # rather than running the block again; one block's otherwise.
+    halves: [..]HalfActs
+    c16: DeviceMemory           # [batch][dc] bf16 the condition vector
+    ada: DeviceMemory           # [batch][the ada group's n] f32: each block's 6 d, then the final norm's 2 d
+    features16: DeviceMemory    # [rows][the input group's k] bf16
+    y16: DeviceMemory           # [rows][d] bf16 the final tokens, normed and modulated
+    hall: DeviceMemory          # [rows][the heads group's n] f32
+    sg_bias: DeviceMemory       # [batch][heads][64][64] bf16 smolgen's biases of the block being run
+    sg_tmp: DeviceMemory        # [batch][heads][SmolCode] f32
+
+    # The stream at the input of block l, or after the last block for l == layers.
+    fn x(l: int) -> DeviceMemory
+        return training ? xs[l] : xs[l % 2]
+
+    fn acts(l: int) -> *HalfActs
+        return training ? &halves[l] : &halves[0]
+
+# A row of a block's qkv in the bf16 pass.
+fn qkv_row(cfg: Config) -> int
+    return cfg.smolgen ? 3 * cfg.d + SmolCompress : 3 * cfg.d
+
+fn half_acts(cfg: Config, batch: int) -> HalfActs
+    var s: HalfActs
+    let b = batch as i64
+    let rows = b * 64
+    let d = cfg.d as i64
+    s.y1 = device_alloc(rows * d * 2)
+    s.qkv = device_alloc(rows * qkv_row(cfg) * 2)
+    s.probs = device_alloc(b * cfg.heads * 4096 * 2)
+    s.att = device_alloc(rows * d * 2)
+    s.o = device_alloc(rows * d * 2)
+    s.y2 = device_alloc(rows * d * 2)
+    s.a = device_alloc(rows * cfg.ffn * 2)
+    s.slope = device_alloc(rows * cfg.ffn * 2)
+    s.f = device_alloc(rows * d * 2)
+    if cfg.smolgen
+        let codes = b * cfg.heads * SmolCode
+        s.sg_comp = device_alloc(b * 64 * SmolCompress * 2)
+        s.sg_h0 = device_alloc(b * SmolHidden * 4)
+        s.sg_h1 = device_alloc(b * SmolHidden * 4)
+        s.sg_h2 = device_alloc(b * SmolHidden * 2)
+        s.sg_z0 = device_alloc(codes * 4)
+        s.sg_z1 = device_alloc(codes * 4)
+        s.sg_z2 = device_alloc(codes * 2)
+    return s
+
+fn pass_buffers(cfg: Config, batch: int, training: bool) -> Pass
+    var p: Pass
+    let b = batch as i64
+    let rows = b * 64
+    let d = cfg.d as i64
+    p.batch = batch
+    p.training = training
+    p.half = use_half(cfg)
+    p.records = device_alloc(b * Record)
+    p.known = device_alloc(b)
+    if not p.half: p.features = device_alloc(rows * Inputs * 4)
+    for i in 0..(training ? cfg.layers + 1 : 2)
+        p.xs.push(device_alloc(rows * d * 4))
+    var s = &p.blk
+    if p.half
+        let l = layout_of(cfg)
+        for i in 0..(training ? cfg.layers : 1)
+            p.halves.push(half_acts(cfg, batch))
+        p.c16 = device_alloc(b * cfg.dc * 2)
+        p.ada = device_alloc(b * l.ada_group.n * 4)
+        p.features16 = device_alloc(rows * l.input_group.k * 2)
+        p.y16 = device_alloc(rows * d * 2)
+        p.hall = device_alloc(rows * l.heads_group.n * 4)
+        if cfg.smolgen
+            p.sg_bias = device_alloc(b * cfg.heads * 4096 * 2)
+            p.sg_tmp = device_alloc(b * cfg.heads * SmolCode * 4)
+    else
+        s.ada = device_alloc(b * 6 * d * 4)
+        s.y1 = device_alloc(rows * d * 4)
+        s.qkv = device_alloc(rows * 3 * d * 4)
+        s.att = device_alloc(rows * d * 4)
+        s.o = device_alloc(rows * d * 4)
+        s.x_mid = device_alloc(rows * d * 4)
+        s.y2 = device_alloc(rows * d * 4)
+        s.h = device_alloc(rows * cfg.ffn * 4)
+        s.a = device_alloc(rows * cfg.ffn * 4)
+        s.f = device_alloc(rows * d * 4)
+    if cfg.smolgen and not p.half
+        let codes = b * cfg.heads * SmolCode * 4
+        s.sg_comp = device_alloc(b * 64 * SmolCompress * 4)
+        s.sg_h0 = device_alloc(b * SmolHidden * 4)
+        s.sg_h1 = device_alloc(b * SmolHidden * 4)
+        s.sg_h2 = device_alloc(b * SmolHidden * 4)
+        s.sg_z0 = device_alloc(codes)
+        s.sg_z1 = device_alloc(codes)
+        s.sg_z2 = device_alloc(codes)
+        s.sg_bias = device_alloc(b * cfg.heads * 4096 * 4)
+    var o = &p.out
+    o.c0 = device_alloc(b * cfg.dc * 4)
+    o.c1 = device_alloc(b * cfg.dc * 4)
+    o.c1s = device_alloc(b * cfg.dc * 4)
+    o.c = device_alloc(b * cfg.dc * 4)
+    if not p.half
+        o.ada = device_alloc(b * 2 * d * 4)
+        o.y = device_alloc(rows * d * 4)
+        o.q = device_alloc(rows * cfg.dp * 4)
+        o.k = device_alloc(rows * cfg.dp * 4)
+        o.under = device_alloc(rows * 3 * 4)
+    o.vflat = device_alloc(b * 64 * HeadTokens * 4)
+    o.vh0 = device_alloc(b * HeadHidden * 4)
+    o.vh1 = device_alloc(b * HeadHidden * 4)
+    o.tflat = device_alloc(b * 64 * HeadTokens * 4)
+    o.th0 = device_alloc(b * HeadHidden * 4)
+    o.th1 = device_alloc(b * HeadHidden * 4)
+    o.policy = device_alloc(b * Classes * 4)
+    o.value = device_alloc(b * 3 * 4)
+    o.time = device_alloc(b * TimeBins * 4)
+    o.salience = device_alloc(b * 64 * 4)
+    return p
+
+# Smolgen (net.Smolgen): attention biases for every head, generated from the whole position.
+fn smolgen_forward(net: *GpuNet, s: *BlockActs, count: int, blk: *BlockLayout)
+    let cfg = net.cfg
+    let heads = cfg.heads
+    linear(s.y1, net.w(blk.sg_compress), none(), s.sg_comp, count * 64, cfg.d, SmolCompress)
+    linear(s.sg_comp, net.w(blk.sg_w0), net.w(blk.sg_b0), s.sg_h0, count, 64 * SmolCompress, SmolHidden)
+    run_silu(count as i64 * SmolHidden, s.sg_h0, s.sg_h1)
+    run_layer_norm(count, SmolHidden, s.sg_h1, s.sg_h2, net.w(blk.sg_ln_w), net.w(blk.sg_ln_b))
+    linear(s.sg_h2, net.w(blk.sg_w3), net.w(blk.sg_b3), s.sg_z0, count, SmolHidden, heads * SmolCode)
+    run_silu(count as i64 * heads * SmolCode, s.sg_z0, s.sg_z1)
+    run_layer_norm(count * heads, SmolCode, s.sg_z1, s.sg_z2, net.w(blk.sg_norm_w), net.w(blk.sg_norm_b))
+    linear(s.sg_z2, net.w(net.layout.sg_shared), none(), s.sg_bias, count * heads, SmolCode, 4096)
+
+# One transformer block (net.Block) from x_in to x_out, keeping what it computes in s.
+fn block_forward(net: *GpuNet, s: *BlockActs, c: DeviceMemory, count: int, blk: *BlockLayout, x_in: DeviceMemory, x_out: DeviceMemory)
+    let cfg = net.cfg
+    let d = cfg.d
+    let rows = count * 64
+    linear(c, net.w(blk.ada_w), net.w(blk.ada_b), s.ada, count, cfg.dc, 6 * d)
+    mark("block: ada")
+    run_ada_norm(rows, d, x_in, s.y1, s.ada, 6 * d, 0, d)
+    mark("block: norms")
+    if cfg.smolgen: smolgen_forward(net, s, count, blk)
+    mark("block: smolgen")
+    linear(s.y1, net.w(blk.qkv_w), net.w(blk.qkv_b), s.qkv, rows, d, 3 * d)
+    mark("block: qkv")
+    run_attention(count, cfg.heads, d / cfg.heads, s.qkv, net.w(blk.rel), cfg.smolgen ? s.sg_bias : none(), s.att)
+    mark("block: attention")
+    linear(s.att, net.w(blk.out_w), net.w(blk.out_b), s.o, rows, d, d)
+    mark("block: out")
+    run_gated_sum(rows, d, x_in, s.o, s.ada, 6 * d, 2 * d, s.x_mid)
+    mark("block: residuals")
+    run_ada_norm(rows, d, s.x_mid, s.y2, s.ada, 6 * d, 3 * d, 4 * d)
+    mark("block: norms")
+    linear(s.y2, net.w(blk.ff1_w), net.w(blk.ff1_b), s.h, rows, d, cfg.ffn)
+    mark("block: ff1")
+    run_gelu(rows as i64 * cfg.ffn, s.h, s.a)
+    mark("block: gelu")
+    linear(s.a, net.w(blk.ff2_w), net.w(blk.ff2_b), s.f, rows, cfg.ffn, d)
+    mark("block: ff2")
+    run_gated_sum(rows, d, s.x_mid, s.f, s.ada, 6 * d, 5 * d, x_out)
+    mark("block: residuals")
+
+# The forward pass of the first count positions in p.records, with p.known saying which are given
+# their think time. Fills p.out's policy, value, time and salience. after, unless null, is called
+# with -1 once the condition and tokens are ready and with l after block l, for checking.
+fn forward(net: *GpuNet, p: *Pass, count: int, after: fn(int) = null)
+    let cfg = net.cfg
+    let l = net.layout
+    let d = cfg.d
+    let dc = cfg.dc
+    let rows = count * 64
+    let o = &p.out
+    run_condition_inputs(count, dc, p.records, p.known, net.params, l, o.c0)
+    linear(o.c0, net.w(l.mlp0_w), net.w(l.mlp0_b), o.c1, count, dc, dc)
+    run_silu(count as i64 * dc, o.c1, o.c1s)
+    linear(o.c1s, net.w(l.mlp2_w), net.w(l.mlp2_b), o.c, count, dc, dc)
+    mark("condition")
+    if p.half
+        half_forward(net, p, count)
+        return
+    run_tokens(count, p.records, p.features, net.params, l, d, p.x(0))
+    mark("tokens")
+    if after != null: after(-1)
+    for i in 0..cfg.layers
+        block_forward(net, &p.blk, o.c, count, &l.blocks[i], p.x(i), p.x(i + 1))
+        if after != null: after(i)
+
+    let x = p.x(cfg.layers)
+    linear(o.c, net.w(l.final_w), net.w(l.final_b), o.ada, count, dc, 2 * d)
+    run_ada_norm(rows, d, x, o.y, o.ada, 2 * d, 0, d)
+    let dp = cfg.dp
+    linear(o.y, net.w(l.pq_w), net.w(l.pq_b), o.q, rows, d, dp)
+    linear(o.y, net.w(l.pk_w), net.w(l.pk_b), o.k, rows, d, dp)
+    # Per position, policy[from * 64 + to] = q[from] . k[to] / sqrt(dp).
+    gemm(64, 64, dp, o.q, dp, 1, 64 * dp, o.k, 1, dp, 64 * dp, o.policy, 64, Classes, count, 1.0 / sqrt(dp as f32))
+    linear(o.y, net.w(l.under_w), net.w(l.under_b), o.under, rows, d, 3)
+    run_underpromotions(count, o.policy, o.under)
+
+    let flat = 64 * HeadTokens
+    linear(o.y, net.w(l.vtok_w), net.w(l.vtok_b), o.vflat, rows, d, HeadTokens)
+    linear(o.vflat, net.w(l.value0_w), net.w(l.value0_b), o.vh0, count, flat, HeadHidden)
+    run_silu(count as i64 * HeadHidden, o.vh0, o.vh1)
+    linear(o.vh1, net.w(l.value2_w), net.w(l.value2_b), o.value, count, HeadHidden, 3)
+    linear(o.y, net.w(l.ttok_w), net.w(l.ttok_b), o.tflat, rows, d, HeadTokens)
+    linear(o.tflat, net.w(l.time0_w), net.w(l.time0_b), o.th0, count, flat, HeadHidden)
+    run_silu(count as i64 * HeadHidden, o.th0, o.th1)
+    linear(o.th1, net.w(l.time2_w), net.w(l.time2_b), o.time, count, HeadHidden, TimeBins)
+    linear(o.y, net.w(l.sal_w), net.w(l.sal_b), o.salience, rows, d, 1)
+    mark("heads")

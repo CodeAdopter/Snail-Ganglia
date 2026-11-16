@@ -1,0 +1,323 @@
+# The losses and the backward pass, in f32: every parameter's gradient of train.py's loss,
+# policy + w_value * value + w_time * time + w_sal * salience.
+
+use cuda/driver
+use model
+use forward
+use kernels/records
+use kernels/gemm
+use kernels/layers
+use kernels/inputs
+use kernels/heads
+
+struct LossWeights
+    value: f32 = 0.1
+    time: f32 = 0.1
+    salience: f32 = 0.1
+
+# The buffers of the bf16 pass's backward pass (half.snail): bf16 unless noted.
+struct HalfGrads
+    dadd: DeviceMemory          # [rows][d] the gradient of a branch that joined the stream
+    dhid: DeviceMemory          # [rows][ffn]
+    dy: DeviceMemory            # [rows][d] the gradient of a norm's output
+    datt: DeviceMemory          # [rows][d]
+    dqkv: DeviceMemory          # [rows] rows as a block's qkv
+    dsg: DeviceMemory           # [batch][heads][4096] the gradient of smolgen's biases
+    dmod: DeviceMemory          # [batch][the ada group's n] f32, and as bf16
+    dmod16: DeviceMemory
+    dall: DeviceMemory          # [rows][the heads group's n] f32, and as bf16
+    dall16: DeviceMemory
+    bias_sums: DeviceMemory     # [a group's n] f32
+    sums: DeviceMemory          # [batch][3 d] f32 column sums per position
+    rel: DeviceMemory           # [batch][heads][225] f32 the relative biases' gradient per position
+    dz_a: DeviceMemory          # [batch][heads][SmolCode] f32, twice, and as bf16
+    dz_b: DeviceMemory
+    dz: DeviceMemory
+    dh_a: DeviceMemory          # [batch][SmolHidden] f32, twice, and as bf16
+    dh_b: DeviceMemory
+    dh: DeviceMemory
+    dcomp: DeviceMemory         # [batch][64 * SmolCompress]
+    ln_sums: DeviceMemory       # [a row per 64 codes][2 SmolCode] f32, the layer norms' sums
+
+fn half_grads(cfg: Config, batch: int) -> HalfGrads
+    var g: HalfGrads
+    let b = batch as i64
+    let rows = b * 64
+    let d = cfg.d as i64
+    g.dadd = device_alloc(rows * d * 2)
+    g.dhid = device_alloc(rows * cfg.ffn * 2)
+    g.dy = device_alloc(rows * d * 2)
+    g.datt = device_alloc(rows * d * 2)
+    let l = layout_of(cfg)
+    g.dqkv = device_alloc(rows * qkv_row(cfg) * 2)
+    g.dmod = device_alloc(b * l.ada_group.n * 4)
+    g.dmod16 = device_alloc(b * l.ada_group.n * 2)
+    g.dall = device_alloc(rows * l.heads_group.n * 4)
+    g.dall16 = device_alloc(rows * l.heads_group.n * 2)
+    g.bias_sums = device_alloc(max(l.ada_group.n, l.heads_group.n) * 4)
+    g.sums = device_alloc(b * 3 * d * 4)
+    g.rel = device_alloc(b * cfg.heads * 225 * 4)
+    if cfg.smolgen
+        let codes = b * cfg.heads * SmolCode
+        g.dsg = device_alloc(b * cfg.heads * 4096 * 2)
+        g.dz_a = device_alloc(codes * 4)
+        g.dz_b = device_alloc(codes * 4)
+        g.dz = device_alloc(codes * 2)
+        g.dh_a = device_alloc(b * SmolHidden * 4)
+        g.dh_b = device_alloc(b * SmolHidden * 4)
+        g.dh = device_alloc(b * SmolHidden * 2)
+        g.dcomp = device_alloc(b * 64 * SmolCompress * 2)
+        g.ln_sums = device_alloc((b * cfg.heads / 64 + 1) * 2 * SmolCode * 4)
+    return g
+
+# The gradient of every parameter, in model.snail's layout, and the buffers of a backward pass of
+# up to batch positions.
+struct Grads
+    half: HalfGrads             # with the bf16 pass, in place of the blocks' f32 buffers
+    params: DeviceMemory
+    dpolicy: DeviceMemory       # [batch][Classes]
+    du: DeviceMemory            # [rows][3]
+    dq: DeviceMemory            # [rows][dp]
+    dk: DeviceMemory
+    dhead: DeviceMemory         # [batch][TimeBins], the value or time head's output
+    dh1: DeviceMemory           # [batch][HeadHidden]
+    dflat: DeviceMemory         # [batch][64 * HeadTokens]
+    dsal: DeviceMemory          # [rows]
+    dmod: DeviceMemory          # [batch][6 d]
+    dx: [2]DeviceMemory         # [rows][d] the stream's gradient, alternating between blocks
+    dy: DeviceMemory            # [rows][d]
+    dtmp: DeviceMemory          # [rows][d]
+    datt: DeviceMemory          # [rows][d]
+    dhid: DeviceMemory          # [rows][ffn]
+    dqkv: DeviceMemory          # [rows][3 d]
+    stats: DeviceMemory         # [rows][2] layer-norm statistics
+    dsg_bias: DeviceMemory      # [batch][heads][4096]
+    dsg_z: DeviceMemory         # [batch][heads][SmolCode], twice
+    dsg_z2: DeviceMemory
+    dsg_h: DeviceMemory         # [batch][SmolHidden], twice
+    dsg_h2: DeviceMemory
+    dsg_comp: DeviceMemory      # [batch][64 * SmolCompress]
+    dc: DeviceMemory            # [batch][dc], and the condition MLP's gradients
+    dc1: DeviceMemory
+    dc0: DeviceMemory
+    loss_policy: DeviceMemory   # [batch] per position, for the means
+    loss_value: DeviceMemory
+    loss_time: DeviceMemory
+    loss_sal: DeviceMemory      # [rows]
+
+    fn g(at: i64) -> DeviceMemory
+        return floats(params, at)
+
+fn grad_buffers(cfg: Config, total: i64, batch: int) -> Grads
+    var g: Grads
+    let b = batch as i64
+    let rows = b * 64
+    let d = cfg.d as i64
+    g.params = device_alloc(total * 4)
+    g.dpolicy = device_alloc(b * Classes * 4)
+    g.dhead = device_alloc(b * TimeBins * 4)
+    g.dh1 = device_alloc(b * HeadHidden * 4)
+    g.dflat = device_alloc(b * 64 * HeadTokens * 4)
+    g.dsal = device_alloc(rows * 4)
+    g.dx[0] = device_alloc(rows * d * 4)
+    g.stats = device_alloc(rows * 2 * 4)
+    let half = use_half(cfg)
+    if half
+        g.half = half_grads(cfg, batch)
+    else
+        g.du = device_alloc(rows * 3 * 4)
+        g.dq = device_alloc(rows * cfg.dp * 4)
+        g.dk = device_alloc(rows * cfg.dp * 4)
+        g.dmod = device_alloc(b * 6 * d * 4)
+        g.dy = device_alloc(rows * d * 4)
+        g.dx[1] = device_alloc(rows * d * 4)
+        g.dtmp = device_alloc(rows * d * 4)
+        g.datt = device_alloc(rows * d * 4)
+        g.dhid = device_alloc(rows * cfg.ffn * 4)
+        g.dqkv = device_alloc(rows * 3 * d * 4)
+    if cfg.smolgen and not half
+        g.dsg_bias = device_alloc(b * cfg.heads * 4096 * 4)
+        g.dsg_z = device_alloc(b * cfg.heads * SmolCode * 4)
+        g.dsg_z2 = device_alloc(b * cfg.heads * SmolCode * 4)
+        g.dsg_h = device_alloc(b * SmolHidden * 4)
+        g.dsg_h2 = device_alloc(b * SmolHidden * 4)
+        g.dsg_comp = device_alloc(b * 64 * SmolCompress * 4)
+    g.dc = device_alloc(b * cfg.dc * 4)
+    g.dc1 = device_alloc(b * cfg.dc * 4)
+    g.dc0 = device_alloc(b * cfg.dc * 4)
+    g.loss_policy = device_alloc(b * 4)
+    g.loss_value = device_alloc(b * 4)
+    g.loss_time = device_alloc(b * 4)
+    g.loss_sal = device_alloc(rows * 4)
+    return g
+
+# The four losses of a batch, as train.py's losses() averages them.
+struct Losses
+    policy: f64
+    value: f64
+    time: f64
+    salience: f64
+    total: f64
+
+# The number of positions in records whose result is known and that count toward the time loss.
+fn loss_counts(records: *u8, known: *u8, count: int) -> (int, int)
+    var results = 0
+    var timed_count = 0
+    for p in 0..count
+        let r = records + p * Record
+        if r[AtResult] < 3: results += 1
+        if timed(r, known[p] != 0): timed_count += 1
+    return results, timed_count
+
+fn device_sum(m: DeviceMemory, n: i64) -> f64
+    let host = alloc[f32](n)
+    download(host, m, n * 4)
+    var s: f64 = 0.0
+    for i in 0..n
+        s += host[i] as f64
+    free(host)
+    return s
+
+# The heads' losses and gradients, then back through the heads to the final norm: leaves the
+# gradient of the last block's output in dx and starts the condition's gradient in g.dc.
+fn heads_backward(net: *GpuNet, p: *Pass, g: *Grads, count: int, w: LossWeights, results: int, timed_count: int, dx: DeviceMemory)
+    let cfg = net.cfg
+    let l = net.layout
+    let o = &p.out
+    let d = cfg.d
+    let dp = cfg.dp
+    let rows = count * 64
+    let flat = 64 * HeadTokens
+    let n = count as f32
+
+    device_zero(g.dpolicy)
+    launch(&kernels, blocks_for(count, 128), 128, 0, gpu_args(policy_loss, count, p.records, o.policy, 1.0 / n, g.dpolicy, g.loss_policy))
+    run_underpromotions_back(count, g.dpolicy, g.du)
+    # The pawn moves' logits are q[from] . k[to] / sqrt(dp) per position.
+    let scale = 1.0 / sqrt(dp as f32)
+    gemm(64, dp, 64, g.dpolicy, 64, 1, Classes, o.k, dp, 1, 64 * dp, g.dq, dp, 64 * dp, count, scale)
+    gemm(64, dp, 64, g.dpolicy, 1, 64, Classes, o.q, dp, 1, 64 * dp, g.dk, dp, 64 * dp, count, scale)
+    linear_backward(g.dq, o.y, net.w(l.pq_w), g.g(l.pq_w), g.g(l.pq_b), g.dy, rows, d, dp)
+    linear_backward(g.dk, o.y, net.w(l.pk_w), g.g(l.pk_w), g.g(l.pk_b), g.dy, rows, d, dp, true)
+    linear_backward(g.du, o.y, net.w(l.under_w), g.g(l.under_w), g.g(l.under_b), g.dy, rows, d, 3, true)
+
+    let vscale = results > 0 ? w.value / results as f32 : 0.0
+    launch(&kernels, blocks_for(count, 128), 128, 0, gpu_args(value_loss, count, p.records, o.value, vscale, g.dhead, g.loss_value))
+    linear_backward(g.dhead, o.vh1, net.w(l.value2_w), g.g(l.value2_w), g.g(l.value2_b), g.dh1, count, HeadHidden, 3)
+    run_silu_back(count as i64 * HeadHidden, o.vh0, g.dh1, g.dh1)
+    linear_backward(g.dh1, o.vflat, net.w(l.value0_w), g.g(l.value0_w), g.g(l.value0_b), g.dflat, count, flat, HeadHidden)
+    linear_backward(g.dflat, o.y, net.w(l.vtok_w), g.g(l.vtok_w), g.g(l.vtok_b), g.dy, rows, d, HeadTokens, true)
+
+    let tscale = timed_count > 0 ? w.time / timed_count as f32 : 0.0
+    launch(&kernels, blocks_for(count, 128), 128, 0, gpu_args(time_loss, count, p.records, p.known, o.time, tscale, g.dhead, g.loss_time))
+    linear_backward(g.dhead, o.th1, net.w(l.time2_w), g.g(l.time2_w), g.g(l.time2_b), g.dh1, count, HeadHidden, TimeBins)
+    run_silu_back(count as i64 * HeadHidden, o.th0, g.dh1, g.dh1)
+    linear_backward(g.dh1, o.tflat, net.w(l.time0_w), g.g(l.time0_w), g.g(l.time0_b), g.dflat, count, flat, HeadHidden)
+    linear_backward(g.dflat, o.y, net.w(l.ttok_w), g.g(l.ttok_w), g.g(l.ttok_b), g.dy, rows, d, HeadTokens, true)
+
+    launch(&kernels, blocks_for(rows, 256), 256, 0, gpu_args(salience_loss, count, p.records, o.salience, w.salience / n, g.dsal, g.loss_sal))
+    linear_backward(g.dsal, o.y, net.w(l.sal_w), g.g(l.sal_w), g.g(l.sal_b), g.dy, rows, d, 1, true)
+
+    run_ada_norm_back(rows, d, p.x(cfg.layers), g.dy, o.ada, 2 * d, 0, d, dx, false, g.stats, g.dmod)
+    linear_backward(g.dmod, o.c, net.w(l.final_w), g.g(l.final_w), g.g(l.final_b), g.dc, count, cfg.dc, 2 * d)
+
+# Smolgen's backward pass from the gradient of its biases (g.dsg_bias): adds its parameters'
+# gradients, and the gradient of its input to dy1.
+fn smolgen_backward(net: *GpuNet, s: *BlockActs, g: *Grads, count: int, blk: *BlockLayout, dy1: DeviceMemory)
+    let cfg = net.cfg
+    let heads = cfg.heads
+    let codes = count * heads
+    let shared = net.layout.sg_shared
+    linear_backward(g.dsg_bias, s.sg_z2, net.w(shared), g.g(shared), none(), g.dsg_z, codes, SmolCode, 4096)
+    run_layer_norm_back(codes, SmolCode, s.sg_z1, g.dsg_z, net.w(blk.sg_norm_w), g.dsg_z2, g.stats, g.g(blk.sg_norm_w), g.g(blk.sg_norm_b))
+    run_silu_back(codes as i64 * SmolCode, s.sg_z0, g.dsg_z2, g.dsg_z2)
+    linear_backward(g.dsg_z2, s.sg_h2, net.w(blk.sg_w3), g.g(blk.sg_w3), g.g(blk.sg_b3), g.dsg_h, count, SmolHidden, heads * SmolCode)
+    run_layer_norm_back(count, SmolHidden, s.sg_h1, g.dsg_h, net.w(blk.sg_ln_w), g.dsg_h2, g.stats, g.g(blk.sg_ln_w), g.g(blk.sg_ln_b))
+    run_silu_back(count as i64 * SmolHidden, s.sg_h0, g.dsg_h2, g.dsg_h2)
+    linear_backward(g.dsg_h2, s.sg_comp, net.w(blk.sg_w0), g.g(blk.sg_w0), g.g(blk.sg_b0), g.dsg_comp, count, 64 * SmolCompress, SmolHidden)
+    linear_backward(g.dsg_comp, s.y1, net.w(blk.sg_compress), g.g(blk.sg_compress), none(), dy1, count * 64, cfg.d, SmolCompress, true)
+
+# One block's backward pass, from the gradient of its output (dout) to that of its input (din),
+# with s holding what its forward pass computed from x_in. Adds its parameters' gradients, and its
+# share of the condition's gradient to g.dc.
+fn block_backward(net: *GpuNet, s: *BlockActs, g: *Grads, c: DeviceMemory, count: int, blk: *BlockLayout, x_in: DeviceMemory, dout: DeviceMemory, din: DeviceMemory)
+    let cfg = net.cfg
+    let d = cfg.d
+    let rows = count * 64
+    let m = 6 * d
+    # x_out = x_mid + g2 * f
+    run_gate_back(rows, d, dout, s.f, s.ada, m, 5 * d, g.dmod, g.dtmp)
+    mark("back: residuals")
+    linear_backward(g.dtmp, s.a, net.w(blk.ff2_w), g.g(blk.ff2_w), g.g(blk.ff2_b), g.dhid, rows, cfg.ffn, d)
+    mark("back: ff2")
+    run_gelu_back(rows as i64 * cfg.ffn, s.h, g.dhid, g.dhid)
+    mark("back: gelu")
+    linear_backward(g.dhid, s.y2, net.w(blk.ff1_w), g.g(blk.ff1_w), g.g(blk.ff1_b), g.dy, rows, d, cfg.ffn)
+    mark("back: ff1")
+    # x_mid feeds both the second norm and the residual: din collects the stream's gradient.
+    device_copy(din, dout, rows as i64 * d * 4)
+    run_ada_norm_back(rows, d, s.x_mid, g.dy, s.ada, m, 3 * d, 4 * d, din, true, g.stats, g.dmod)
+    mark("back: norms")
+    # x_mid = x_in + g1 * o
+    run_gate_back(rows, d, din, s.o, s.ada, m, 2 * d, g.dmod, g.dtmp)
+    mark("back: residuals")
+    linear_backward(g.dtmp, s.att, net.w(blk.out_w), g.g(blk.out_w), g.g(blk.out_b), g.datt, rows, d, d)
+    mark("back: out")
+    run_attention_back(count, cfg.heads, d / cfg.heads, s.qkv, s.att, g.datt, net.w(blk.rel), cfg.smolgen ? s.sg_bias : none(), g.dqkv, g.g(blk.rel), cfg.smolgen ? g.dsg_bias : none())
+    mark("back: attention")
+    linear_backward(g.dqkv, s.y1, net.w(blk.qkv_w), g.g(blk.qkv_w), g.g(blk.qkv_b), g.dy, rows, d, 3 * d)
+    mark("back: qkv")
+    if cfg.smolgen: smolgen_backward(net, s, g, count, blk, g.dy)
+    mark("back: smolgen")
+    run_ada_norm_back(rows, d, x_in, g.dy, s.ada, m, 0, d, din, true, g.stats, g.dmod)
+    mark("back: norms")
+    linear_backward(g.dmod, c, net.w(blk.ada_w), g.g(blk.ada_w), g.g(blk.ada_b), g.dc, count, cfg.dc, m, true)
+    mark("back: ada")
+
+# Every parameter's gradient of the loss over the first count positions of a training pass that
+# forward has just run, into g.params; returns the losses. Each block's forward pass runs again
+# before its backward pass, from the stream at its input, except the last block's, whose values
+# are still in p.blk.
+fn backward(net: *GpuNet, p: *Pass, g: *Grads, count: int, w: LossWeights, results: int, timed_count: int) -> Losses
+    let cfg = net.cfg
+    let l = net.layout
+    let o = &p.out
+    let rows = count * 64
+    device_zero(g.params)
+    mark("back: zero")
+    if p.half
+        half_backward(net, p, g, count, w, results, timed_count)
+    else
+        heads_backward(net, p, g, count, w, results, timed_count, g.dx[0])
+        mark("back: heads and losses")
+        var at = 0
+        var i = cfg.layers - 1
+        while i >= 0
+            let blk = &l.blocks[i]
+            if i < cfg.layers - 1
+                block_forward(net, &p.blk, o.c, count, blk, p.x(i), p.x(i + 1))
+            block_backward(net, &p.blk, g, o.c, count, blk, p.x(i), g.dx[at], g.dx[1 - at])
+            at = 1 - at
+            i -= 1
+
+        # The tokens: the input layer on the features, plus the position embedding.
+        let dx0 = g.dx[at]
+        linear_backward(dx0, p.features, net.w(l.inp_w), g.g(l.inp_w), g.g(l.inp_b), none(), rows, Inputs, cfg.d)
+        run_column_sums(count, 64 * cfg.d, dx0, g.g(l.pos))
+
+    # The condition: its MLP, then the tables and embeddings of its inputs.
+    let dc = cfg.dc
+    linear_backward(g.dc, o.c1s, net.w(l.mlp2_w), g.g(l.mlp2_w), g.g(l.mlp2_b), g.dc1, count, dc, dc)
+    run_silu_back(count as i64 * dc, o.c1, g.dc1, g.dc1)
+    linear_backward(g.dc1, o.c0, net.w(l.mlp0_w), g.g(l.mlp0_w), g.g(l.mlp0_b), g.dc0, count, dc, dc)
+    run_condition_back(count, dc, p.records, p.known, g.dc0, g.params, l)
+    mark("back: tokens and condition")
+
+    var losses: Losses
+    let n = count as f64
+    losses.policy = device_sum(g.loss_policy, count) / n
+    losses.value = results > 0 ? device_sum(g.loss_value, count) / results as f64 : 0.0
+    losses.time = timed_count > 0 ? device_sum(g.loss_time, count) / timed_count as f64 : 0.0
+    losses.salience = device_sum(g.loss_sal, rows) / n
+    losses.total = losses.policy + w.value as f64 * losses.value + w.time as f64 * losses.time + w.salience as f64 * losses.salience
+    return losses

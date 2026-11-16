@@ -1,0 +1,313 @@
+# The bf16 pass: the forward and backward passes for eval and train, as PyTorch's autocast runs
+# them. The residual stream, the parameters' gradients and the small layers stay f32; everything
+# that branches off the stream is bf16 in GPU memory, so the matrix products (kernels/mm.snail)
+# and attention (kernels/attention16.snail) read their operands as they are.
+#
+# Three things differ from the f32 pass (forward.snail, backward.snail) besides the rounding:
+#
+# - A training pass keeps every block's values, and the backward pass reads them instead of
+#   running each block again.
+# - Neighboring layers share kernels: GELU and its derivative are computed where the first
+#   feed-forward product is written, a residual add runs with the norm after it, and a norm's
+#   backward pass with the gate's before it. The stream is updated in place: block l's x(l + 1)
+#   first holds the stream after attention, and from the next block's start (or the final norm)
+#   the stream after the feed-forward.
+# - Linears that read the same input run as one product (model.snail's LinearGroup): every
+#   block's scales, shifts and gates and the final norm's from the condition; the six heads that
+#   read the final tokens; and, with smolgen, a block's qkv with smolgen's compression.
+#
+# The condition's inputs and MLP, the value and time heads' small layers and the losses run as in
+# the f32 pass.
+
+use cuda/driver
+use model
+use forward
+use backward
+use kernels/records
+use kernels/gemm
+use kernels/mm
+use kernels/pack
+use kernels/layers
+use kernels/stream
+use kernels/attention16
+use kernels/inputs
+use kernels/heads
+
+# Smolgen from a block's compressed squares (s.sg_comp) to its attention biases (p.sg_bias): its
+# small layers in f32, the products on bf16.
+fn half_smolgen_forward(net: *GpuNet, p: *Pass, s: *HalfActs, count: int, blk: *BlockLayout)
+    let heads = net.cfg.heads
+    let codes = count * heads
+    mm_linear_floats(s.sg_comp, net.h(blk.sg_w0), net.w(blk.sg_b0), s.sg_h0, count, 64 * SmolCompress, SmolHidden)
+    run_silu(count as i64 * SmolHidden, s.sg_h0, s.sg_h1)
+    run_layer_norm(count, SmolHidden, s.sg_h1, p.sg_tmp, net.w(blk.sg_ln_w), net.w(blk.sg_ln_b))
+    to_halves(count as i64 * SmolHidden, p.sg_tmp, s.sg_h2)
+    mm_linear_floats(s.sg_h2, net.h(blk.sg_w3), net.w(blk.sg_b3), s.sg_z0, count, SmolHidden, heads * SmolCode)
+    run_silu(codes as i64 * SmolCode, s.sg_z0, s.sg_z1)
+    run_layer_norm(codes, SmolCode, s.sg_z1, p.sg_tmp, net.w(blk.sg_norm_w), net.w(blk.sg_norm_b))
+    to_halves(codes as i64 * SmolCode, p.sg_tmp, s.sg_z2)
+    mm_linear(s.sg_z2, net.h(net.layout.sg_shared), none(), p.sg_bias, codes, SmolCode, 4096)
+
+# Every block, from the tokens in p.x(0) to the stream after the last block's attention in
+# p.x(layers) and its feed-forward's output in the last block's f.
+fn half_blocks_forward(net: *GpuNet, p: *Pass, count: int)
+    let cfg = net.cfg
+    let l = net.layout
+    let d = cfg.d
+    let m = l.ada_group.n
+    let rows = count * 64
+    let row = qkv_row(cfg)
+    for i in 0..cfg.layers
+        let blk = &l.blocks[i]
+        let s = p.acts(i)
+        let at = i * 6 * d
+        # The block's input: the stream after the block before's feed-forward.
+        if i == 0
+            run_resid_norm(rows, d, p.x(0), none(), none(), p.x(0), p.ada, m, at, at + d, s.y1)
+        else
+            run_resid_norm(rows, d, p.x(i), p.acts(i - 1).f, floats(p.ada, at - d), p.x(i), p.ada, m, at, at + d, s.y1)
+        mark("block: norms")
+        if cfg.smolgen
+            let group = l.qkv_groups[i]
+            mm_linear(s.y1, net.group_w(group), net.group_b(group), s.qkv, rows, d, row)
+            mark("block: qkv")
+            run_take_half_columns(rows, row, 3 * d, SmolCompress, s.qkv, s.sg_comp)
+            half_smolgen_forward(net, p, s, count, blk)
+            mark("block: smolgen")
+        else
+            mm_linear(s.y1, net.h(blk.qkv_w), net.w(blk.qkv_b), s.qkv, rows, d, row)
+            mark("block: qkv")
+        run_attention16(count, cfg.heads, row, s.qkv, net.w(blk.rel), cfg.smolgen ? p.sg_bias : none(), s.att, s.probs)
+        mark("block: attention")
+        mm_linear(s.att, net.h(blk.out_w), net.w(blk.out_b), s.o, rows, d, d)
+        mark("block: out")
+        run_resid_norm(rows, d, p.x(i), s.o, floats(p.ada, at + 2 * d), p.x(i + 1), p.ada, m, at + 3 * d, at + 4 * d, s.y2)
+        mark("block: norms")
+        mm_linear_gelu(s.y2, net.h(blk.ff1_w), net.w(blk.ff1_b), s.a, s.slope, rows, d, cfg.ffn)
+        mark("block: ff1")
+        mm_linear(s.a, net.h(blk.ff2_w), net.w(blk.ff2_b), s.f, rows, cfg.ffn, d)
+        mark("block: ff2")
+
+# The final norm and the heads, from the last block's values: fills p.out's policy, value, time
+# and salience.
+fn half_heads_forward(net: *GpuNet, p: *Pass, count: int)
+    let cfg = net.cfg
+    let l = net.layout
+    let o = &p.out
+    let d = cfg.d
+    let dp = cfg.dp
+    let m = l.ada_group.n
+    let rows = count * 64
+    let top = cfg.layers - 1
+    let final = cfg.layers * 6 * d
+    run_resid_norm(rows, d, p.x(cfg.layers), p.acts(top).f, floats(p.ada, final - d), p.x(cfg.layers), p.ada, m, final, final + d, p.y16)
+    mark("block: norms")
+    let group = l.heads_group
+    let at = l.head_columns
+    let n = group.n
+    mm_linear_floats(p.y16, net.group_w(group), net.group_b(group), p.hall, rows, d, n)
+    # Per position, policy[from * 64 + to] = q[from] . k[to] / sqrt(dp).
+    gemm(64, 64, dp, floats(p.hall, at.q), n, 1, 64 * n, floats(p.hall, at.k), 1, n, 64 * n, o.policy, 64, Classes, count, 1.0 / sqrt(dp as f32))
+    run_underpromotions(count, o.policy, floats(p.hall, at.under), n)
+
+    let flat = 64 * HeadTokens
+    run_take_columns(rows, n, at.vtok, HeadTokens, p.hall, o.vflat)
+    linear(o.vflat, net.w(l.value0_w), net.w(l.value0_b), o.vh0, count, flat, HeadHidden)
+    run_silu(count as i64 * HeadHidden, o.vh0, o.vh1)
+    linear(o.vh1, net.w(l.value2_w), net.w(l.value2_b), o.value, count, HeadHidden, 3)
+    run_take_columns(rows, n, at.ttok, HeadTokens, p.hall, o.tflat)
+    linear(o.tflat, net.w(l.time0_w), net.w(l.time0_b), o.th0, count, flat, HeadHidden)
+    run_silu(count as i64 * HeadHidden, o.th0, o.th1)
+    linear(o.th1, net.w(l.time2_w), net.w(l.time2_b), o.time, count, HeadHidden, TimeBins)
+    run_take_columns(rows, n, at.sal, 1, p.hall, o.salience)
+    mark("heads")
+
+# The forward pass from the condition vector in p.out.c on.
+fn half_forward(net: *GpuNet, p: *Pass, count: int)
+    let cfg = net.cfg
+    let l = net.layout
+    let rows = count * 64
+    # Every block's scales, shifts and gates, and the final norm's.
+    let ada = l.ada_group
+    to_halves(count as i64 * cfg.dc, p.out.c, p.c16)
+    mm_linear_floats(p.c16, net.group_w(ada), net.group_b(ada), p.ada, count, cfg.dc, ada.n)
+    mark("block: ada")
+    # The square tokens: the input layer on each square's features, plus its position embedding.
+    let input = l.input_group
+    run_token_halves(count, p.records, input.k, p.features16)
+    mm_linear_floats(p.features16, net.group_w(input), net.group_b(input), p.x(0), rows, input.k, cfg.d)
+    run_add_rows(rows, cfg.d, 64, p.x(0), net.w(l.pos))
+    mark("tokens")
+    half_blocks_forward(net, p, count)
+    half_heads_forward(net, p, count)
+
+# The heads' losses and gradients, then back through the heads and the final norm: leaves the
+# gradient of the stream after the last block's attention in dx, that of the last block's f in
+# g.half.dadd with its sums per position in g.half.sums, and the final norm's part of g.half.dmod.
+fn half_heads_backward(net: *GpuNet, p: *Pass, g: *Grads, count: int, w: LossWeights, results: int, timed_count: int, dx: DeviceMemory)
+    let cfg = net.cfg
+    let l = net.layout
+    let o = &p.out
+    let hg = &g.half
+    let d = cfg.d
+    let dp = cfg.dp
+    let rows = count * 64
+    let flat = 64 * HeadTokens
+    let group = l.heads_group
+    let at = l.head_columns
+    let n = group.n
+    let positions = count as f32
+
+    device_zero(g.dpolicy)
+    launch(&kernels, blocks_for(count, 128), 128, 0, gpu_args(policy_loss, count, p.records, o.policy, 1.0 / positions, g.dpolicy, g.loss_policy))
+    run_underpromotions_back(count, g.dpolicy, floats(hg.dall, at.under), n)
+    # The pawn moves' logits are q[from] . k[to] / sqrt(dp) per position.
+    let scale = 1.0 / sqrt(dp as f32)
+    gemm(64, dp, 64, g.dpolicy, 64, 1, Classes, floats(p.hall, at.k), n, 1, 64 * n, floats(hg.dall, at.q), n, 64 * n, count, scale)
+    gemm(64, dp, 64, g.dpolicy, 1, 64, Classes, floats(p.hall, at.q), n, 1, 64 * n, floats(hg.dall, at.k), n, 64 * n, count, scale)
+
+    let vscale = results > 0 ? w.value / results as f32 : 0.0
+    launch(&kernels, blocks_for(count, 128), 128, 0, gpu_args(value_loss, count, p.records, o.value, vscale, g.dhead, g.loss_value))
+    linear_backward(g.dhead, o.vh1, net.w(l.value2_w), g.g(l.value2_w), g.g(l.value2_b), g.dh1, count, HeadHidden, 3)
+    run_silu_back(count as i64 * HeadHidden, o.vh0, g.dh1, g.dh1)
+    linear_backward(g.dh1, o.vflat, net.w(l.value0_w), g.g(l.value0_w), g.g(l.value0_b), g.dflat, count, flat, HeadHidden)
+    run_put_columns(rows, n, at.vtok, HeadTokens, g.dflat, hg.dall)
+
+    let tscale = timed_count > 0 ? w.time / timed_count as f32 : 0.0
+    launch(&kernels, blocks_for(count, 128), 128, 0, gpu_args(time_loss, count, p.records, p.known, o.time, tscale, g.dhead, g.loss_time))
+    linear_backward(g.dhead, o.th1, net.w(l.time2_w), g.g(l.time2_w), g.g(l.time2_b), g.dh1, count, HeadHidden, TimeBins)
+    run_silu_back(count as i64 * HeadHidden, o.th0, g.dh1, g.dh1)
+    linear_backward(g.dh1, o.tflat, net.w(l.time0_w), g.g(l.time0_w), g.g(l.time0_b), g.dflat, count, flat, HeadHidden)
+    run_put_columns(rows, n, at.ttok, HeadTokens, g.dflat, hg.dall)
+
+    launch(&kernels, blocks_for(rows, 256), 256, 0, gpu_args(salience_loss, count, p.records, o.salience, w.salience / positions, g.dsal, g.loss_sal))
+    run_put_columns(rows, n, at.sal, 1, g.dsal, hg.dall)
+
+    # The group: its biases' and weights' gradients, and that of the final tokens.
+    device_zero(hg.bias_sums)
+    run_column_sums(rows, n, hg.dall, hg.bias_sums)
+    run_scatter_add(n, hg.bias_sums, net.group_bias_from(group), g.params)
+    to_halves(rows as i64 * n, hg.dall, hg.dall16)
+    mm_group_weight_gradient(hg.dall16, p.y16, net.group_from(group), g.params, rows, d, n)
+    mm_input_gradient(hg.dall16, net.group_w(group), hg.dy, rows, d, n)
+
+    # The final norm read the stream after the last block, whose feed-forward joined it last.
+    let m = l.ada_group.n
+    let final = cfg.layers * 6 * d
+    run_norm_back_gate(count, d, m, p.x(cfg.layers), none(), none(), hg.dy, floats(p.ada, final), dx, true,
+        p.halves[cfg.layers - 1].f, floats(p.ada, final - d), hg.dadd, floats(hg.dmod, final), floats(hg.dmod, final + d),
+        floats(hg.dmod, final - d), hg.sums)
+
+# Smolgen's backward pass from the gradient of its biases (g.half.dsg) to that of the block's
+# compressed squares (g.half.dcomp), adding its parameters' gradients on the way.
+fn half_smolgen_backward(net: *GpuNet, s: *HalfActs, g: *Grads, count: int, blk: *BlockLayout)
+    let hg = &g.half
+    let heads = net.cfg.heads
+    let codes = count * heads
+    let shared = net.layout.sg_shared
+    mm_weight_gradient(hg.dsg, s.sg_z2, g.g(shared), codes, SmolCode, 4096)
+    mm_input_gradient_floats(hg.dsg, net.h(shared), hg.dz_a, codes, SmolCode, 4096)
+    run_layer_norm_back_sums(codes, SmolCode, s.sg_z1, hg.dz_a, net.w(blk.sg_norm_w), hg.dz_b, g.stats, hg.ln_sums, g.g(blk.sg_norm_w))
+    run_silu_back(codes as i64 * SmolCode, s.sg_z0, hg.dz_b, hg.dz_b)
+    to_halves(codes as i64 * SmolCode, hg.dz_b, hg.dz)
+    mm_weight_gradient(hg.dz, s.sg_h2, g.g(blk.sg_w3), count, SmolHidden, heads * SmolCode)
+    run_column_sums(count, heads * SmolCode, hg.dz_b, g.g(blk.sg_b3))
+    mm_input_gradient_floats(hg.dz, net.h(blk.sg_w3), hg.dh_a, count, SmolHidden, heads * SmolCode)
+    run_layer_norm_back_sums(count, SmolHidden, s.sg_h1, hg.dh_a, net.w(blk.sg_ln_w), hg.dh_b, g.stats, hg.ln_sums, g.g(blk.sg_ln_w))
+    run_silu_back(count as i64 * SmolHidden, s.sg_h0, hg.dh_b, hg.dh_b)
+    to_halves(count as i64 * SmolHidden, hg.dh_b, hg.dh)
+    mm_weight_gradient(hg.dh, s.sg_comp, g.g(blk.sg_w0), count, 64 * SmolCompress, SmolHidden)
+    run_column_sums(count, SmolHidden, hg.dh_b, g.g(blk.sg_b0))
+    mm_input_gradient(hg.dh, net.h(blk.sg_w0), hg.dcomp, count, 64 * SmolCompress, SmolHidden)
+
+# Every block's backward pass, last block first, after half_heads_backward. dx [rows][d] f32 is
+# updated in place down to the gradient of the tokens. Adds the blocks' parameters' gradients
+# except their adas', whose outputs' gradients fill g.half.dmod.
+fn half_blocks_backward(net: *GpuNet, p: *Pass, g: *Grads, count: int, dx: DeviceMemory)
+    let cfg = net.cfg
+    let l = net.layout
+    let hg = &g.half
+    let d = cfg.d
+    let m = l.ada_group.n
+    let rows = count * 64
+    let row = qkv_row(cfg)
+    var i = cfg.layers - 1
+    while i >= 0
+        let blk = &l.blocks[i]
+        let s = &p.halves[i]
+        let at = i * 6 * d
+        # hg.dadd holds the gradient of f and hg.sums its sums per position.
+        run_column_sums(count, d, hg.sums, g.g(blk.ff2_b))
+        mark("back: residuals")
+        mm_weight_gradient(hg.dadd, s.a, g.g(blk.ff2_w), rows, cfg.ffn, d)
+        mm_input_gradient_times(hg.dadd, net.h(blk.ff2_w), s.slope, hg.dhid, g.g(blk.ff1_b), rows, cfg.ffn, d)
+        mark("back: ff2")
+        mm_weight_gradient(hg.dhid, s.y2, g.g(blk.ff1_w), rows, d, cfg.ffn)
+        mm_input_gradient(hg.dhid, net.h(blk.ff1_w), hg.dy, rows, d, cfg.ffn)
+        mark("back: ff1")
+        # The second norm read the stream after attention, x(i) + g1 o; then o's gradient.
+        run_norm_back_gate(count, d, m, p.x(i), s.o, floats(p.ada, at + 2 * d), hg.dy, floats(p.ada, at + 3 * d), dx, false,
+            s.o, floats(p.ada, at + 2 * d), hg.dadd, floats(hg.dmod, at + 3 * d), floats(hg.dmod, at + 4 * d),
+            floats(hg.dmod, at + 2 * d), hg.sums)
+        run_column_sums(count, d, hg.sums, g.g(blk.out_b))
+        mark("back: norms")
+        mm_weight_gradient(hg.dadd, s.att, g.g(blk.out_w), rows, d, d)
+        mm_input_gradient(hg.dadd, net.h(blk.out_w), hg.datt, rows, d, d)
+        mark("back: out")
+        run_attention_back16(count, cfg.heads, row, s.qkv, s.probs, hg.datt, hg.dqkv, cfg.smolgen ? hg.dsg : none(), hg.rel, hg.sums)
+        run_column_sums(count, cfg.heads * 225, hg.rel, g.g(blk.rel))
+        run_column_sums(count, 3 * d, hg.sums, g.g(blk.qkv_b))
+        mark("back: attention")
+        if cfg.smolgen
+            # The compressed squares' gradient goes beside qkv's, as the forward pass had them.
+            half_smolgen_backward(net, s, g, count, blk)
+            run_put_half_columns(rows, row, 3 * d, SmolCompress, hg.dcomp, hg.dqkv)
+            mark("back: smolgen")
+            let group = l.qkv_groups[i]
+            mm_group_weight_gradient(hg.dqkv, s.y1, net.group_from(group), g.params, rows, d, row)
+            mm_input_gradient(hg.dqkv, net.group_w(group), hg.dy, rows, d, row)
+        else
+            mm_weight_gradient(hg.dqkv, s.y1, g.g(blk.qkv_w), rows, d, row)
+            mm_input_gradient(hg.dqkv, net.h(blk.qkv_w), hg.dy, rows, d, row)
+        mark("back: qkv")
+        # The first norm read the block's input, x(i); then the gradient of the block before's
+        # f, which made that input.
+        if i > 0
+            run_norm_back_gate(count, d, m, p.x(i), none(), none(), hg.dy, floats(p.ada, at), dx, false,
+                p.halves[i - 1].f, floats(p.ada, at - d), hg.dadd, floats(hg.dmod, at), floats(hg.dmod, at + d),
+                floats(hg.dmod, at - d), hg.sums)
+        else
+            run_norm_back_gate(count, d, m, p.x(i), none(), none(), hg.dy, floats(p.ada, at), dx, false,
+                none(), none(), none(), floats(hg.dmod, at), floats(hg.dmod, at + d), none(), none())
+        mark("back: norms")
+        i -= 1
+
+# The backward pass down to the condition vector, whose gradient it leaves in g.dc.
+fn half_backward(net: *GpuNet, p: *Pass, g: *Grads, count: int, w: LossWeights, results: int, timed_count: int)
+    let cfg = net.cfg
+    let l = net.layout
+    let hg = &g.half
+    let d = cfg.d
+    let rows = count * 64
+    let dx = g.dx[0]
+    half_heads_backward(net, p, g, count, w, results, timed_count, dx)
+    mark("back: heads and losses")
+    half_blocks_backward(net, p, g, count, dx)
+
+    # The tokens: the input layer on the features, plus the position embedding.
+    let input = l.input_group
+    to_halves(rows as i64 * d, dx, hg.dy)
+    mm_group_weight_gradient(hg.dy, p.features16, net.group_from(input), g.params, rows, input.k, d)
+    run_column_sums(rows, d, dx, g.g(l.inp_b))
+    run_column_sums(count, 64 * d, dx, g.g(l.pos))
+    mark("back: tokens and condition")
+
+    # Every block's ada and the final norm's.
+    let ada = l.ada_group
+    device_zero(hg.bias_sums)
+    run_column_sums(count, ada.n, hg.dmod, hg.bias_sums)
+    run_scatter_add(ada.n, hg.bias_sums, net.group_bias_from(ada), g.params)
+    to_halves(count as i64 * ada.n, hg.dmod, hg.dmod16)
+    mm_group_weight_gradient(hg.dmod16, p.c16, net.group_from(ada), g.params, count, cfg.dc, ada.n)
+    mm_input_gradient_split(hg.dmod16, net.group_w(ada), g.dc, count, cfg.dc, ada.n)
+    mark("back: ada")

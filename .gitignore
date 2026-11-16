@@ -1,0 +1,9 @@
+# Build output, of the trainer and of tools/positions
+build/
+
+# Trained nets and their reference files: published on Hugging Face, not on GitHub
+weights/
+
+# Game files, positions and training runs kept beside the source
+data/
+runs/

@@ -1,0 +1,440 @@
+# Attention for 32-wide heads on the tensor cores, in the bf16 pass (half.snail): q, k, v and what
+# comes back are bf16 in GPU memory, and the scores and the softmax are f32.
+#
+# One warp per head of a position. Its 64 x 32 matrices (a head's q, k, v, or the gradient of its
+# output) are copied to shared memory as they are and read from there as the fragments warp_mma
+# takes, whichever way a product needs them (warp_load_matrix and its transposed form), as
+# kernels/mm.snail does. A 64 x 64 result is spread over the warp as warp_mma leaves it: with
+# g = lane / 4 and t2 = lane % 4, a lane holds, of every 16 rows, rows g and g + 8, and of every 8
+# columns, columns 2 t2 and 2 t2 + 1. A row's 64 values are therefore in the 4 lanes that share g.
+# Those are also the values the lane passes as the a tile of a product over the columns, so the
+# softmax goes into the next product without moving.
+
+use cuda/driver
+use kernels/gemm
+use kernels/layers
+use kernels/mm
+
+# Rows of the tiles in shared memory, in bf16: 8 more than the values, so that the 8 rows one
+# matrix load reads fall in different banks.
+const AttRow = Head + 8
+const AttTile = 64 * AttRow
+const AttWide = 64 + 8
+const AttWideTile = 64 * AttWide
+
+# Queues the copy of a 64 x 32 matrix whose row r starts at src[r * stride] to a tile.
+@inline
+fn att_stage(tile: *bf16, src: *bf16, stride: i64)
+    let lane = lane_index()
+    @unroll
+    for e in 0..8
+        let piece = lane + 32 * e
+        let r = piece / 4
+        let c = (piece % 4) * 8
+        shared_copy_async(tile + r * AttRow + c, src + (r as i64 * stride + c), 16)
+
+# Queues the copy of a 64 x 64 matrix stored row by row to a wide tile.
+@inline
+fn att_stage_wide(tile: *bf16, src: *bf16)
+    let lane = lane_index()
+    @unroll
+    for e in 0..16
+        let piece = lane + 32 * e
+        let r = piece / 8
+        let c = (piece % 8) * 8
+        shared_copy_async(tile + r * AttWide + c, src + (r * 64 + c), 16)
+
+# A lane's values of a 16 x 16 piece of a product's a tile, read from a tile in shared memory
+# whose rows are `row` apart: with the piece's rows the tile's rows from r0 and its k the tile's
+# columns from c0, or, transposed, its rows the tile's columns from c0 and its k the tile's rows
+# from r0.
+@inline
+fn att_a(frag: *[8]bf16, tile: *bf16, row: int, r0: int, c0: int)
+    let r = lane_index() % 8
+    let q = lane_index() / 8
+    warp_load_matrix(frag, tile + (r0 + r + 8 * (q & 1)) * row + c0 + 8 * (q >> 1))
+
+@inline
+fn att_a_transposed(frag: *[8]bf16, tile: *bf16, row: int, r0: int, c0: int)
+    let r = lane_index() % 8
+    let q = lane_index() / 8
+    warp_load_matrix_transposed(frag, tile + (r0 + r + 8 * (q >> 1)) * row + c0 + 8 * (q & 1))
+
+# A lane's values of two 16 x 8 pieces of a product's b tile side by side: with their columns the
+# tile's rows from r0 and their k the tile's columns from c0, or, transposed, their columns the
+# tile's columns from c0 and their k the tile's rows from r0.
+@inline
+fn att_b(frag: *[8]bf16, tile: *bf16, row: int, r0: int, c0: int)
+    let r = lane_index() % 8
+    let q = lane_index() / 8
+    warp_load_matrix(frag, tile + (r0 + r + 8 * (q >> 1)) * row + c0 + 8 * (q & 1))
+
+@inline
+fn att_b_transposed(frag: *[8]bf16, tile: *bf16, row: int, r0: int, c0: int)
+    let r = lane_index() % 8
+    let q = lane_index() / 8
+    warp_load_matrix_transposed(frag, tile + (r0 + r + 8 * (q & 1)) * row + c0 + 8 * (q >> 1))
+
+fn word_low(w: u32) -> bf16
+    return bf16.from_bits((w & 0xFFFF) as u16)
+
+fn word_high(w: u32) -> bf16
+    return bf16.from_bits((w >> 16) as u16)
+
+# softmax(q k^T / sqrt(32) + rel + bias) v for one head of one position. qkv is
+# [positions * 64] rows of `stride` bf16 that start with q, k and v, d each; bias, unless null, smolgen's [positions][heads][64][64] bf16; out
+# [positions * 64][d] bf16. The softmax, rounded to bf16 as it is multiplied, is kept in probs
+# [positions][heads][64][64] for the backward pass. The grid is heads x positions, blocks of one
+# warp, with attention16_shared() bytes of shared memory.
+@kernel
+fn attention16(heads: int, stride: int, qkv: *bf16, rel: *f32, bias: *bf16, out: *bf16, probs: *bf16)
+    let h = block_index().x
+    let p = block_index().y as i64
+    let lane = lane_index()
+    let g = lane / 4
+    let t2 = lane % 4
+    let d = heads * Head
+    let base = qkv + (p * 64 * stride + h * Head)
+    let tq = shared_memory[bf16]()
+    let tk = tq + AttTile
+    let tv = tk + AttTile
+    att_stage(tq, base, stride)
+    att_stage(tk, base + d, stride)
+    att_stage(tv, base + 2 * d, stride)
+    shared_copy_commit()
+    shared_copy_wait(0)
+    sync_warp()
+
+    # The scores q k^T: rows the query squares, columns the key squares.
+    var s: [4][8][4]f32
+    @unroll
+    for kh in 0..2
+        var fq: [4][8]bf16
+        var fk: [4][8]bf16
+        @unroll
+        for i in 0..4
+            att_a(&fq[i], tq, AttRow, 16 * i, 16 * kh)
+        @unroll
+        for jj in 0..4
+            att_b(&fk[jj], tk, AttRow, 16 * jj, 16 * kh)
+        @unroll
+        for i in 0..4
+            @unroll
+            for j in 0..8
+                warp_mma(&s[i][j], &fq[i], &fk[j / 2][(j % 2) * 4] as *[4]bf16)
+
+    let scale = 1.0 / sqrt(Head as f32)
+    let hrel = rel + h * 225
+    let brow = bias + (p * heads + h) * 4096
+    let prow = probs + (p * heads + h) * 4096
+    var pw: [4][8][2]u32
+    @unroll
+    for i in 0..4
+        @unroll
+        for half in 0..2
+            let row = 16 * i + g + 8 * half
+            var most: f32 = -3.0e38
+            @unroll
+            for j in 0..8
+                let col = 8 * j + 2 * t2
+                var v0 = s[i][j][2 * half] * scale + hrel[rel_index(row, col)]
+                var v1 = s[i][j][2 * half + 1] * scale + hrel[rel_index(row, col + 1)]
+                if bias != null
+                    let w = ((brow + (row * 64 + col)) as *u32)[0]
+                    v0 += word_low(w) as f32
+                    v1 += word_high(w) as f32
+                s[i][j][2 * half] = v0
+                s[i][j][2 * half + 1] = v1
+                most = max(most, max(v0, v1))
+            most = max(most, warp_shuffle_xor(most, 1))
+            most = max(most, warp_shuffle_xor(most, 2))
+            var total: f32 = 0.0
+            @unroll
+            for j in 0..8
+                let e0 = fast_exp(s[i][j][2 * half] - most)
+                let e1 = fast_exp(s[i][j][2 * half + 1] - most)
+                s[i][j][2 * half] = e0
+                s[i][j][2 * half + 1] = e1
+                total += e0 + e1
+            total += warp_shuffle_xor(total, 1)
+            total += warp_shuffle_xor(total, 2)
+            let inv = 1.0 / total
+            @unroll
+            for j in 0..8
+                let w = half_pair(s[i][j][2 * half] * inv, s[i][j][2 * half + 1] * inv)
+                ((prow + (row * 64 + 8 * j + 2 * t2)) as *u32)[0] = w
+                pw[i][j][half] = w
+
+    # The output p v: k runs over the key squares, 16 at a time.
+    var o: [4][4][4]f32
+    @unroll
+    for kb in 0..4
+        var fv: [2][8]bf16
+        @unroll
+        for np in 0..2
+            att_b_transposed(&fv[np], tv, AttRow, 16 * kb, 16 * np)
+        @unroll
+        for i in 0..4
+            var fp: [8]bf16
+            @unroll
+            for c in 0..2
+                @unroll
+                for half in 0..2
+                    fp[4 * c + 2 * half] = word_low(pw[i][2 * kb + c][half])
+                    fp[4 * c + 2 * half + 1] = word_high(pw[i][2 * kb + c][half])
+            @unroll
+            for nt in 0..4
+                warp_mma(&o[i][nt], &fp, &fv[nt / 2][(nt % 2) * 4] as *[4]bf16)
+
+    let orow = out + (p * 64 * d + h * Head)
+    @unroll
+    for i in 0..4
+        @unroll
+        for half in 0..2
+            let row = 16 * i + g + 8 * half
+            @unroll
+            for nt in 0..4
+                let col = 8 * nt + 2 * t2
+                ((orow + (row as i64 * d + col)) as *u32)[0] = half_pair(o[i][nt][2 * half], o[i][nt][2 * half + 1])
+
+fn attention16_shared() -> int
+    return 3 * AttTile * 2
+
+# Writes a 64 x 32 result of a product, held as warp_mma leaves it, times scale to rows of
+# `stride` from to as bf16, and its column sums to sums[0..32].
+@inline
+fn att_store(acc: *[4][4][4]f32, scale: f32, to: *bf16, stride: i64, sums: *f32)
+    let g = lane_index() / 4
+    let t2 = lane_index() % 4
+    @unroll
+    for nt in 0..4
+        let col = 8 * nt + 2 * t2
+        var sum0: f32 = 0.0
+        var sum1: f32 = 0.0
+        @unroll
+        for i in 0..4
+            @unroll
+            for half in 0..2
+                let row = 16 * i + g + 8 * half
+                let v0 = acc[i][nt][2 * half] * scale
+                let v1 = acc[i][nt][2 * half + 1] * scale
+                ((to + (row as i64 * stride + col)) as *u32)[0] = half_pair(v0, v1)
+                sum0 += v0
+                sum1 += v1
+        # The 8 lanes with this lane's t2 hold the pair's other rows.
+        sum0 += warp_shuffle_xor(sum0, 4)
+        sum0 += warp_shuffle_xor(sum0, 8)
+        sum0 += warp_shuffle_xor(sum0, 16)
+        sum1 += warp_shuffle_xor(sum1, 4)
+        sum1 += warp_shuffle_xor(sum1, 8)
+        sum1 += warp_shuffle_xor(sum1, 16)
+        if g == 0
+            sums[col] = sum0
+            sums[col + 1] = sum1
+
+# The backward pass of attention16 for one head of one position: with P the softmax the forward
+# pass kept, O its output and dO the gradient of O (dout, [positions * 64][d] bf16):
+# dV = P^T dO, dS = P (dO V^T - rowsum(P dO V^T)), dQ = dS K / sqrt(32), dK = dS^T Q / sqrt(32).
+# dqkv is laid out as qkv, in rows of `stride`. dS is also the gradient of smolgen's biases, written to dbias
+# [positions][heads][64][64] bf16 unless it is null, and, summed over the pairs of squares with
+# the same relative position, that of the relative biases: this head's 225 sums go to
+# drel [positions][heads][225], and the column sums of its part of dqkv to
+# sums [positions][3 d], for kernels that add them over the positions.
+# Shared memory: one 64 x 32 tile, which holds dO, then V, then K, then Q, each copied in when the
+# one before is done with; the 64 x 64 P and then dS; and 225 floats. The less shared memory a
+# warp needs, the more of them a multiprocessor runs at once.
+@kernel
+fn attention_back16(heads: int, stride: int, qkv: *bf16, probs: *bf16, dout: *bf16, dqkv: *bf16, dbias: *bf16, drel: *f32, sums: *f32)
+    let h = block_index().x
+    let p = block_index().y as i64
+    let lane = lane_index()
+    let g = lane / 4
+    let t2 = lane % 4
+    let d = heads * Head
+    let base = qkv + (p * 64 * stride + h * Head)
+    let to = dqkv + (p * 64 * stride + h * Head)
+    let my_sums = sums + (p * 3 * d + h * Head)
+    let slot = shared_memory[bf16]()
+    let tp = slot + AttTile
+    let bins = (tp + AttWideTile) as *f32
+    att_stage(slot, dout + (p * 64 * d + h * Head), d)
+    att_stage_wide(tp, probs + (p * heads + h) * 4096)
+    shared_copy_commit()
+    @unroll
+    for e in 0..8
+        let b = lane + 32 * e
+        if b < 225: bins[b] = 0.0
+    shared_copy_wait(0)
+    sync_warp()
+
+    # dV = P^T dO: rows the key squares, k the query squares.
+    var acc: [4][4][4]f32
+    @unroll
+    for kb in 0..4
+        var fa: [4][8]bf16
+        var fb: [2][8]bf16
+        @unroll
+        for jm in 0..4
+            att_a_transposed(&fa[jm], tp, AttWide, 16 * kb, 16 * jm)
+        @unroll
+        for np in 0..2
+            att_b_transposed(&fb[np], slot, AttRow, 16 * kb, 16 * np)
+        @unroll
+        for jm in 0..4
+            @unroll
+            for nt in 0..4
+                warp_mma(&acc[jm][nt], &fa[jm], &fb[nt / 2][(nt % 2) * 4] as *[4]bf16)
+    att_store(&acc, 1.0, to + 2 * d, stride, my_sums + 2 * d)
+
+    # dO V^T: rows the query squares, columns the key squares. The lane takes its values of dO
+    # first, so that V can follow dO in the tile.
+    var fd: [2][4][8]bf16
+    @unroll
+    for kh in 0..2
+        @unroll
+        for i in 0..4
+            att_a(&fd[kh][i], slot, AttRow, 16 * i, 16 * kh)
+    att_stage(slot, base + 2 * d, stride)
+    shared_copy_commit()
+    shared_copy_wait(0)
+    sync_warp()
+    var s: [4][8][4]f32
+    @unroll
+    for kh in 0..2
+        var fb: [4][8]bf16
+        @unroll
+        for jj in 0..4
+            att_b(&fb[jj], slot, AttRow, 16 * jj, 16 * kh)
+        @unroll
+        for i in 0..4
+            @unroll
+            for j in 0..8
+                warp_mma(&s[i][j], &fd[kh][i], &fb[j / 2][(j % 2) * 4] as *[4]bf16)
+
+    # V is done with: K takes its place while dS is computed.
+    att_stage(slot, base + d, stride)
+    shared_copy_commit()
+
+    # dS in its place, a row at a time, with P read from its tile as the lane holds dS.
+    let grow = dbias + (p * heads + h) * 4096
+    var rb: [2][15]f32
+    @unroll
+    for i in 0..4
+        var pf: [4][8]bf16
+        @unroll
+        for jb in 0..4
+            att_a(&pf[jb], tp, AttWide, 16 * i, 16 * jb)
+        @unroll
+        for half in 0..2
+            let row = 16 * i + g + 8 * half
+            var dot: f32 = 0.0
+            @unroll
+            for j in 0..8
+                @unroll
+                for e in 0..2
+                    dot += (pf[j / 2][(j % 2) * 4 + 2 * half + e] as f32) * s[i][j][2 * half + e]
+            dot += warp_shuffle_xor(dot, 1)
+            dot += warp_shuffle_xor(dot, 2)
+            @unroll
+            for j in 0..8
+                let ds0 = (pf[j / 2][(j % 2) * 4 + 2 * half] as f32) * (s[i][j][2 * half] - dot)
+                let ds1 = (pf[j / 2][(j % 2) * 4 + 2 * half + 1] as f32) * (s[i][j][2 * half + 1] - dot)
+                s[i][j][2 * half] = ds0
+                s[i][j][2 * half + 1] = ds1
+                if dbias != null
+                    ((grow + (row * 64 + 8 * j + 2 * t2)) as *u32)[0] = half_pair(ds0, ds1)
+                # The key square is on rank j and the query square on rank 2 i + half.
+                rb[0][j - 2 * i - half + 7] += ds0
+                rb[1][j - 2 * i - half + 7] += ds1
+    # The lane's sums by relative position (rel_index): its columns are files 2 t2 and 2 t2 + 1,
+    # its rows file g.
+    @unroll
+    for e in 0..2
+        @unroll
+        for rank in 0..15
+            atomic_add(&bins[(2 * t2 + e - g + 7) * 15 + rank], rb[e][rank])
+
+    # dQ = dS K / sqrt(32): k the key squares.
+    shared_copy_wait(0)
+    sync_warp()
+    let scale = 1.0 / sqrt(Head as f32)
+    @unroll
+    for i in 0..4
+        @unroll
+        for nt in 0..4
+            @unroll
+            for e in 0..4
+                acc[i][nt][e] = 0.0
+    @unroll
+    for kb in 0..4
+        var fb: [2][8]bf16
+        @unroll
+        for np in 0..2
+            att_b_transposed(&fb[np], slot, AttRow, 16 * kb, 16 * np)
+        @unroll
+        for i in 0..4
+            var fa: [8]bf16
+            @unroll
+            for c in 0..2
+                @unroll
+                for e in 0..4
+                    fa[4 * c + e] = s[i][2 * kb + c][e] as bf16
+            @unroll
+            for nt in 0..4
+                warp_mma(&acc[i][nt], &fa, &fb[nt / 2][(nt % 2) * 4] as *[4]bf16)
+    att_store(&acc, scale, to, stride, my_sums)
+
+    # Q takes K's place while dS replaces P in its tile and the sums by relative position leave.
+    att_stage(slot, base, stride)
+    shared_copy_commit()
+    @unroll
+    for i in 0..4
+        @unroll
+        for half in 0..2
+            let row = 16 * i + g + 8 * half
+            @unroll
+            for j in 0..8
+                ((tp + (row * AttWide + 8 * j + 2 * t2)) as *u32)[0] = half_pair(s[i][j][2 * half], s[i][j][2 * half + 1])
+    shared_copy_wait(0)
+    sync_warp()
+    let my_rel = drel + (p * heads + h) * 225
+    @unroll
+    for e in 0..8
+        let b = lane + 32 * e
+        if b < 225: my_rel[b] = bins[b]
+
+    # dK = dS^T Q / sqrt(32): rows the key squares, k the query squares.
+    @unroll
+    for i in 0..4
+        @unroll
+        for nt in 0..4
+            @unroll
+            for e in 0..4
+                acc[i][nt][e] = 0.0
+    @unroll
+    for kb in 0..4
+        var fa: [4][8]bf16
+        var fb: [2][8]bf16
+        @unroll
+        for jm in 0..4
+            att_a_transposed(&fa[jm], tp, AttWide, 16 * kb, 16 * jm)
+        @unroll
+        for np in 0..2
+            att_b_transposed(&fb[np], slot, AttRow, 16 * kb, 16 * np)
+        @unroll
+        for jm in 0..4
+            @unroll
+            for nt in 0..4
+                warp_mma(&acc[jm][nt], &fa[jm], &fb[nt / 2][(nt % 2) * 4] as *[4]bf16)
+    att_store(&acc, scale, to + d, stride, my_sums + d)
+
+fn attention_back16_shared() -> int
+    return (AttTile + AttWideTile) * 2 + 225 * 4
+
+fn run_attention16(positions: int, heads: int, stride: int, qkv: DeviceMemory, rel: DeviceMemory, bias: DeviceMemory, out: DeviceMemory, probs: DeviceMemory)
+    launch_on(&kernels, Stream(handle: null), heads, positions, 1, 32, 1, 1, attention16_shared(),
+        gpu_args(attention16, heads, stride, qkv, rel, bias, out, probs))
+
+fn run_attention_back16(positions: int, heads: int, stride: int, qkv: DeviceMemory, probs: DeviceMemory, dout: DeviceMemory, dqkv: DeviceMemory, dbias: DeviceMemory, drel: DeviceMemory, sums: DeviceMemory)
+    launch_on(&kernels, Stream(handle: null), heads, positions, 1, 32, 1, 1, attention_back16_shared(),
+        gpu_args(attention_back16, heads, stride, qkv, probs, dout, dqkv, dbias, drel, sums))

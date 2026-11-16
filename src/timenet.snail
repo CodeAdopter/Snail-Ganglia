@@ -1,0 +1,633 @@
+# The small think-time net: a few hundred thousand parameters that predict how long a move takes,
+# as the 32 think-time bins of the full net's time head, from numbers a program has without the
+# full net (kernels/timefeat.snail).
+#
+#   hot[HotFeatures]  ->  Linear(embed) -> SiLU  \
+#                                                 \
+#   dense[DenseFeatures]  ------------------------ joined -> Linear(hidden1) -> SiLU
+#                                                 /        -> Linear(hidden2) -> SiLU
+#   64 square tokens -> transformer -> Linear   /          -> Linear(32 bins)
+#
+# The 0-or-1 inputs (the piece on each square, the squares of two moves) go through a narrow layer
+# of their own first, so they cost embed parameters each instead of hidden1.
+#
+# The trunk is optional (trunk 0 for none): the same 0-or-1 inputs as one token per square, through
+# transformer blocks of the full net's kind (forward.snail's block_forward, without smolgen and
+# with nothing to condition on, so each block's scales, shifts and gates are parameters), a layer
+# norm, and a Linear that hands trunk_out numbers per square to the first hidden layer.
+#
+# The net is trained on the bin of the real think time, on the full net's distribution over the
+# bins, or on a mix of the two: the loss is the cross-entropy against
+# (1 - distill) * the real bin + distill * the full net's distribution. A row without the full
+# net's predictions (timeset.snail) is trained on the real bin alone.
+
+use cuda/driver
+use model
+use checkpoint
+use quantized
+use forward
+use backward
+use timeset
+use kernels/records
+use kernels/gemm
+use kernels/layers
+use kernels/pack
+use kernels/heads
+use kernels/optim
+use kernels/timefeat
+
+extern include "math.h"
+extern "erf" fn c_erf(x: f64) -> f64
+
+# A square token's inputs: the piece on the square (12), and whether the opponent's last move left
+# or reached it and the move about to be played leaves or reaches it.
+const TokenInputs = 16
+# The blocks' condition vector, which is all zeros here: the full net's blocks take their scales,
+# shifts and gates from one, and with zeros they are the biases of each block's ada.
+const TrunkCondition = 8
+
+struct TimeConfig
+    groups: int                 # the input groups the net reads (kernels/timefeat.snail)
+    embed: int                  # the width of the 0-or-1 inputs' layer, 0 for none
+    hidden1: int
+    hidden2: int
+    trunk: int = 0              # the width of the square tokens' transformer, 0 for none
+    trunk_layers: int = 0
+    trunk_heads: int = 0
+    trunk_out: int = 0          # the numbers per square it hands to the first hidden layer
+
+    # The trunk's outputs for a position.
+    fn tokens() -> int
+        return trunk > 0 ? 64 * trunk_out : 0
+
+    # The inputs of the first hidden layer: the dense inputs, the 0-or-1 inputs' layer, the trunk.
+    fn joined() -> int
+        return DenseFeatures + embed + tokens()
+
+    # The trunk as the full net's blocks see it.
+    fn blocks() -> Config
+        return Config(d: trunk, layers: trunk_layers, heads: trunk_heads, ffn: 4 * trunk, dc: TrunkCondition, dp: 0, smolgen: false)
+
+# Where each tensor lives in the parameter buffer: Linear weights [out][in], as PyTorch has them.
+struct TimeLayout
+    cfg: TimeConfig
+    opt: *Layout                # the tensors for the optimizer, which only reads their sizes and decay
+    total: i64
+    embed_w: i64                # [embed][HotFeatures]
+    embed_b: i64
+    token_w: i64                # [trunk][TokenInputs]
+    token_b: i64
+    pos: i64                    # [64][trunk]
+    blocks: [..]BlockLayout
+    token_out_w: i64            # [trunk_out][trunk]
+    token_out_b: i64
+    w1: i64                     # [hidden1][joined]
+    b1: i64
+    w2: i64                     # [hidden2][hidden1]
+    b2: i64
+    w3: i64                     # [TimeBins][hidden2]
+    b3: i64
+
+fn time_layout(cfg: TimeConfig) -> *TimeLayout
+    let t = new TimeLayout
+    let l = new Layout
+    t.cfg = cfg
+    t.opt = l
+    if cfg.embed > 0
+        t.embed_w = l.weight("embed.weight", cfg.embed, HotFeatures)
+        t.embed_b = l.bias("embed.bias", cfg.embed, HotFeatures)
+    if cfg.trunk > 0
+        let d = cfg.trunk as i64
+        t.token_w = l.weight("tokens.weight", d, TokenInputs)
+        t.token_b = l.bias("tokens.bias", d, TokenInputs)
+        t.pos = l.normal("tokens.pos", 64 * d, 0.02, false)
+        for i in 0..cfg.trunk_layers
+            let b = t.blocks.add()
+            b.ada_w = l.zero_weight(block_name(i, "ada.weight"), 6 * d, TrunkCondition)
+            b.ada_b = l.zeros(block_name(i, "ada.bias"), 6 * d, false)
+            b.qkv_w = l.weight(block_name(i, "qkv.weight"), 3 * d, d)
+            b.qkv_b = l.bias(block_name(i, "qkv.bias"), 3 * d, d)
+            b.out_w = l.weight(block_name(i, "out.weight"), d, d)
+            b.out_b = l.bias(block_name(i, "out.bias"), d, d)
+            b.ff1_w = l.weight(block_name(i, "ff1.weight"), 4 * d, d)
+            b.ff1_b = l.bias(block_name(i, "ff1.bias"), 4 * d, d)
+            b.ff2_w = l.weight(block_name(i, "ff2.weight"), d, 4 * d)
+            b.ff2_b = l.bias(block_name(i, "ff2.bias"), d, 4 * d)
+            b.rel = l.zeros(block_name(i, "rel"), cfg.trunk_heads * 225, true)
+        t.token_out_w = l.weight("tokens.out.weight", cfg.trunk_out, d)
+        t.token_out_b = l.bias("tokens.out.bias", cfg.trunk_out, d)
+    t.w1 = l.weight("hidden1.weight", cfg.hidden1, cfg.joined())
+    t.b1 = l.bias("hidden1.bias", cfg.hidden1, cfg.joined())
+    t.w2 = l.weight("hidden2.weight", cfg.hidden2, cfg.hidden1)
+    t.b2 = l.bias("hidden2.bias", cfg.hidden2, cfg.hidden1)
+    t.w3 = l.weight("out.weight", TimeBins, cfg.hidden2)
+    t.b3 = l.bias("out.bias", TimeBins, cfg.hidden2)
+    t.total = l.total
+    return t
+
+# A new net's parameters: every Linear as PyTorch starts one (init_linear), from seed. A block's
+# scales, shifts, gates and relative biases start at zero, as the full net's do, so each block
+# starts as the identity; the position embedding starts normal with standard deviation 0.02.
+fn time_init(t: *TimeLayout, seed: u64) -> *f32
+    let params = alloc[f32](t.total)
+    let rng = new TorchRandom
+    rng.seed(seed as u32)
+    let cfg = t.cfg
+    if cfg.embed > 0: init_linear(rng, params, t.embed_w, t.embed_b, cfg.embed, HotFeatures)
+    if cfg.trunk > 0
+        let d = cfg.trunk as i64
+        init_linear(rng, params, t.token_w, t.token_b, d, TokenInputs)
+        rng.normal(params + t.pos, 64 * d, 0.02)
+        for i in 0..cfg.trunk_layers
+            let b = &t.blocks[i]
+            init_linear(rng, params, b.qkv_w, b.qkv_b, 3 * d, d)
+            init_linear(rng, params, b.out_w, b.out_b, d, d)
+            init_linear(rng, params, b.ff1_w, b.ff1_b, 4 * d, d)
+            init_linear(rng, params, b.ff2_w, b.ff2_b, d, 4 * d)
+        init_linear(rng, params, t.token_out_w, t.token_out_b, cfg.trunk_out, d)
+    init_linear(rng, params, t.w1, t.b1, cfg.hidden1, cfg.joined())
+    init_linear(rng, params, t.w2, t.b2, cfg.hidden2, cfg.hidden1)
+    init_linear(rng, params, t.w3, t.b3, TimeBins, cfg.hidden2)
+    return params
+
+# ---- the net's file ------------------------------------------------------------------------------
+#
+#   0     "GTIMENET"
+#   8     i32 version (2), groups, embed, hidden1, hidden2, DenseFeatures, HotFeatures, TimeBins
+#   40    i64 parameter count, f64 the log loss in bits on the 3+0 and 3+2 test positions when saved
+#   56    u8 the trunk's width / 8, layers, heads and outputs per square (0 without a trunk), 4 zero
+#         bytes
+#   64    the parameters as f32, in time_layout's order: embed.weight [embed][hot], embed.bias; with
+#         a trunk, tokens.weight [trunk][16], tokens.bias, tokens.pos [64][trunk], each block's
+#         tensors as the full net's (model.snail) and tokens.out.weight [trunk_out][trunk],
+#         tokens.out.bias; hidden1.weight [hidden1][joined], hidden1.bias, hidden2.weight
+#         [hidden2][hidden1], hidden2.bias, out.weight [32][hidden2], out.bias
+
+fn save_time_net(path: str, t: *TimeLayout, params: *f32, metric: f64) -> bool
+    var header: [64]u8
+    copy(&header[0], "GTIMENET".ptr, 8)
+    put_i32(&header[8], 2)
+    put_i32(&header[12], t.cfg.groups)
+    put_i32(&header[16], t.cfg.embed)
+    put_i32(&header[20], t.cfg.hidden1)
+    put_i32(&header[24], t.cfg.hidden2)
+    put_i32(&header[28], DenseFeatures)
+    put_i32(&header[32], HotFeatures)
+    put_i32(&header[36], TimeBins)
+    put_i64(&header[40], t.total)
+    put_i64(&header[48], metric.bits as i64)
+    header[56] = (t.cfg.trunk / 8) as u8
+    header[57] = t.cfg.trunk_layers as u8
+    header[58] = t.cfg.trunk_heads as u8
+    header[59] = t.cfg.trunk_out as u8
+    var (f, ok) = create_file(path)
+    if not ok: return false
+    let good = f.write(header[0..64]) and f.write((params as *u8)[0..t.total * 4])
+    f.close()
+    return good
+
+fn load_time_net(path: str) -> (*TimeLayout, *f32)
+    let data = unquantized(read_whole(path), path)
+    if data.len < 64 or data[0..8] as str != "GTIMENET": fail2("not a think-time net: ", path)
+    let p = data.ptr
+    if le_i32(p + 28) != DenseFeatures or le_i32(p + 32) != HotFeatures or le_i32(p + 36) != TimeBins
+        fail2("think-time net made for other inputs: ", path)
+    let t = time_layout(TimeConfig(groups: le_i32(p + 12), embed: le_i32(p + 16), hidden1: le_i32(p + 20), hidden2: le_i32(p + 24),
+        trunk: p[56] as int * 8, trunk_layers: p[57], trunk_heads: p[58], trunk_out: p[59]))
+    if data.len != 64 + t.total * 4: fail2("think-time net has the wrong size: ", path)
+    return t, (p + 64) as *f32
+
+# ---- kernels -------------------------------------------------------------------------------------
+
+# One thread per row of a time set: its inputs, the dense ones at the start of a row of `stride`
+# in x.
+@kernel
+fn time_inputs(count: int, rows: *u8, groups: int, x: *f32, stride: int, hot: *f32)
+    let p = block_index().x * block_size().x + thread_index().x
+    if p >= count: return
+    time_features(rows + p as i64 * TimeRow, groups, x + p as i64 * stride, hot + p as i64 * HotFeatures)
+
+# One thread per input of each square's token, from the 0-or-1 inputs of its position.
+@kernel
+fn token_inputs(count: int, hot: *f32, tokens: *f32)
+    let i = block_index().x as i64 * block_size().x + thread_index().x
+    if i >= count as i64 * 64 * TokenInputs: return
+    let f = (i % TokenInputs) as int
+    let row = i / TokenInputs
+    let sq = (row % 64) as int
+    let h = hot + (row / 64) * HotFeatures
+    tokens[i] = f < 12 ? h[HotSquares + sq * 12 + f] : h[HotLast + (f - 12) * 64 + sq]
+
+# wide[row][first + j] = silu(narrow[row][j]) for rows of `stride` and j below width.
+@kernel
+fn silu_columns(rows: int, stride: int, first: int, width: int, narrow: *f32, wide: *f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i >= rows * width: return
+    let row = i / width
+    let x = narrow[i]
+    wide[row as i64 * stride + first + i - row * width] = x / (1.0 + exp(-x))
+
+# The backward pass of silu_columns: dnarrow[row][j] = dwide[row][first + j] * silu'(narrow[row][j]).
+@kernel
+fn silu_columns_back(rows: int, stride: int, first: int, width: int, narrow: *f32, dwide: *f32, dnarrow: *f32)
+    let i = block_index().x * block_size().x + thread_index().x
+    if i >= rows * width: return
+    let row = i / width
+    let x = narrow[i]
+    let s = 1.0 / (1.0 + exp(-x))
+    dnarrow[i] = dwide[row as i64 * stride + first + i - row * width] * s * (1.0 + x * (1.0 - s))
+
+# One thread per row: the loss of the net's logits and its gradient times scale. The target is
+# (1 - distill) on the bin of the real think time plus distill times the full net's distribution.
+# out[row] gets the cross-entropy against the real bin and the divergence from the full net's
+# distribution to the net's, in nats. Rows without a think time, or from a side's first move, get
+# zeros.
+@kernel
+fn time_net_loss(count: int, rows: *u8, logits: *f32, distill: f32, scale: f32, dlogits: *f32, out: *f32)
+    let p = block_index().x * block_size().x + thread_index().x
+    if p >= count: return
+    let row = rows + p as i64 * TimeRow
+    let grad = dlogits + p * TimeBins
+    let o = out + p * 2
+    let think = rec_u16(row, AtThink)
+    if think == NoClock or rec_u16(row, AtPly) < 2
+        for i in 0..TimeBins
+            grad[i] = 0.0
+        o[0] = 0.0
+        o[1] = 0.0
+        return
+    let x = logits + p * TimeBins
+    let t = (row + AtTeacher) as *f32
+    let taught = ((row + AtLegalCount) as *f32)[0] > 0.0
+    let share = taught ? distill : 0.0
+    var most: f32 = -3.0e38
+    var t_most: f32 = -3.0e38
+    for i in 0..TimeBins
+        most = max(most, x[i])
+        t_most = max(t_most, t[i])
+    var total: f32 = 0.0
+    var t_total: f32 = 0.0
+    for i in 0..TimeBins
+        total += exp(x[i] - most)
+        t_total += exp(t[i] - t_most)
+    let norm = log(total) + most
+    let t_norm = log(t_total) + t_most
+    let target = time_bin(think)
+    var divergence: f32 = 0.0
+    for i in 0..TimeBins
+        let log_q = x[i] - norm
+        let log_p = t[i] - t_norm
+        let teacher = exp(log_p)
+        let y = (1.0 - share) * (i == target ? 1.0 : 0.0) + share * teacher
+        grad[i] = scale * (exp(log_q) - y)
+        divergence += teacher * (log_p - log_q)
+    o[0] = norm - x[target]
+    o[1] = taught ? divergence : 0.0
+
+# ---- the passes ----------------------------------------------------------------------------------
+
+# The trunk's buffers: the full net's blocks run on them (block_forward and block_backward), each
+# block keeping its values for the backward pass.
+struct Trunk
+    net: GpuNet                 # the blocks' view of the parameters
+    grads: Grads                # and of the gradient, with the blocks' scratch
+    acts: [..]BlockActs
+    condition: DeviceMemory     # [batch][TrunkCondition] zeros
+    inputs: DeviceMemory        # [rows][TokenInputs]
+    xs: [..]DeviceMemory        # [rows][trunk] the stream at each block's input, and after the last
+    plain: DeviceMemory         # [batch][2 trunk] zeros: the last norm has no scale or shift
+    dplain: DeviceMemory
+    y: DeviceMemory             # [rows][trunk] the stream after the last norm
+    out: DeviceMemory           # [rows][trunk_out]
+    dout: DeviceMemory
+    dx: [2]DeviceMemory         # [rows][trunk] the stream's gradient, alternating between blocks
+
+fn new_trunk(cfg: TimeConfig, params: DeviceMemory, grads: DeviceMemory, batch: int) -> Trunk
+    var k: Trunk
+    let c = cfg.blocks()
+    let b = batch as i64
+    let rows = b * 64
+    let d = c.d as i64
+    k.net = GpuNet(cfg: c, params: params)
+    k.grads.params = grads
+    k.grads.dmod = device_alloc(b * 6 * d * 4)
+    k.grads.dy = device_alloc(rows * d * 4)
+    k.grads.dtmp = device_alloc(rows * d * 4)
+    k.grads.datt = device_alloc(rows * d * 4)
+    k.grads.dhid = device_alloc(rows * c.ffn * 4)
+    k.grads.dqkv = device_alloc(rows * 3 * d * 4)
+    k.grads.stats = device_alloc(rows * 2 * 4)
+    k.grads.dc = device_alloc(b * TrunkCondition * 4)
+    for i in 0..c.layers
+        let s = k.acts.add()
+        s.ada = device_alloc(b * 6 * d * 4)
+        s.y1 = device_alloc(rows * d * 4)
+        s.qkv = device_alloc(rows * 3 * d * 4)
+        s.att = device_alloc(rows * d * 4)
+        s.o = device_alloc(rows * d * 4)
+        s.x_mid = device_alloc(rows * d * 4)
+        s.y2 = device_alloc(rows * d * 4)
+        s.h = device_alloc(rows * c.ffn * 4)
+        s.a = device_alloc(rows * c.ffn * 4)
+        s.f = device_alloc(rows * d * 4)
+    for i in 0..c.layers + 1
+        k.xs.push(device_alloc(rows * d * 4))
+    k.condition = device_alloc(b * TrunkCondition * 4)
+    k.inputs = device_alloc(rows * TokenInputs * 4)
+    k.plain = device_alloc(b * 2 * d * 4)
+    k.dplain = device_alloc(b * 2 * d * 4)
+    k.y = device_alloc(rows * d * 4)
+    k.out = device_alloc(rows * cfg.trunk_out * 4)
+    k.dout = device_alloc(rows * cfg.trunk_out * 4)
+    k.dx[0] = device_alloc(rows * d * 4)
+    k.dx[1] = device_alloc(rows * d * 4)
+    return k
+
+# A net on the GPU, and the buffers of its passes over up to `batch` rows.
+struct TimeNet
+    layout: *TimeLayout
+    batch: int
+    params: DeviceMemory
+    grads: DeviceMemory
+    rows: DeviceMemory          # [batch][TimeRow]
+    hot: DeviceMemory           # [batch][HotFeatures]
+    e0: DeviceMemory            # [batch][embed] the 0-or-1 inputs' layer before SiLU
+    x: DeviceMemory             # [batch][joined] the dense inputs, that layer after SiLU, the trunk's outputs
+    h1: DeviceMemory            # [batch][hidden1] before SiLU, and after
+    a1: DeviceMemory
+    h2: DeviceMemory            # [batch][hidden2] the same
+    a2: DeviceMemory
+    logits: DeviceMemory        # [batch][TimeBins]
+    dlogits: DeviceMemory
+    da2: DeviceMemory
+    da1: DeviceMemory
+    dx: DeviceMemory
+    de0: DeviceMemory
+    loss: DeviceMemory          # [batch][2]
+    trunk: Trunk
+
+    fn w(at: i64) -> DeviceMemory
+        return floats(params, at)
+
+    fn g(at: i64) -> DeviceMemory
+        return floats(grads, at)
+
+fn new_time_net(t: *TimeLayout, host: *f32, batch: int) -> *TimeNet
+    let n = new TimeNet
+    let cfg = t.cfg
+    let b = batch as i64
+    n.layout = t
+    n.batch = batch
+    n.params = device_alloc(t.total * 4)
+    upload(n.params, host, t.total * 4)
+    n.grads = device_alloc(t.total * 4)
+    n.rows = device_alloc(b * TimeRow)
+    n.hot = device_alloc(b * HotFeatures * 4)
+    n.e0 = device_alloc(b * cfg.embed * 4)
+    n.x = device_alloc(b * cfg.joined() * 4)
+    n.h1 = device_alloc(b * cfg.hidden1 * 4)
+    n.a1 = device_alloc(b * cfg.hidden1 * 4)
+    n.h2 = device_alloc(b * cfg.hidden2 * 4)
+    n.a2 = device_alloc(b * cfg.hidden2 * 4)
+    n.logits = device_alloc(b * TimeBins * 4)
+    n.dlogits = device_alloc(b * TimeBins * 4)
+    n.da2 = device_alloc(b * cfg.hidden2 * 4)
+    n.da1 = device_alloc(b * cfg.hidden1 * 4)
+    n.dx = device_alloc(b * cfg.joined() * 4)
+    n.de0 = device_alloc(b * cfg.embed * 4)
+    n.loss = device_alloc(b * 2 * 4)
+    if cfg.trunk > 0: n.trunk = new_trunk(cfg, n.params, n.grads, batch)
+    return n
+
+# The trunk's outputs for the first count rows, from their 0-or-1 inputs in n.hot, into their
+# columns of n.x.
+fn trunk_forward(n: *TimeNet, count: int)
+    let t = n.layout
+    let cfg = t.cfg
+    let k = &n.trunk
+    let d = cfg.trunk
+    let rows = count * 64
+    launch(&kernels, blocks_for(rows as i64 * TokenInputs, 256), 256, 0, gpu_args(token_inputs, count, n.hot, k.inputs))
+    linear(k.inputs, n.w(t.token_w), n.w(t.token_b), k.xs[0], rows, TokenInputs, d)
+    run_add_rows(rows, d, 64, k.xs[0], n.w(t.pos))
+    for i in 0..cfg.trunk_layers
+        block_forward(&k.net, &k.acts[i], k.condition, count, &t.blocks[i], k.xs[i], k.xs[i + 1])
+    run_ada_norm(rows, d, k.xs[cfg.trunk_layers], k.y, k.plain, 2 * d, 0, d)
+    linear(k.y, n.w(t.token_out_w), n.w(t.token_out_b), k.out, rows, d, cfg.trunk_out)
+    run_put_columns(count, cfg.joined(), DenseFeatures + cfg.embed, cfg.tokens(), k.out, n.x)
+
+# The trunk's backward pass, from the gradient of its outputs in their columns of n.dx.
+fn trunk_backward(n: *TimeNet, count: int)
+    let t = n.layout
+    let cfg = t.cfg
+    let k = &n.trunk
+    let g = &k.grads
+    let d = cfg.trunk
+    let rows = count * 64
+    device_zero(g.dc)
+    run_take_columns(count, cfg.joined(), DenseFeatures + cfg.embed, cfg.tokens(), n.dx, k.dout)
+    linear_backward(k.dout, k.y, n.w(t.token_out_w), n.g(t.token_out_w), n.g(t.token_out_b), g.dy, rows, d, cfg.trunk_out)
+    run_ada_norm_back(rows, d, k.xs[cfg.trunk_layers], g.dy, k.plain, 2 * d, 0, d, k.dx[0], false, g.stats, k.dplain)
+    var at = 0
+    var i = cfg.trunk_layers - 1
+    while i >= 0
+        block_backward(&k.net, &k.acts[i], g, k.condition, count, &t.blocks[i], k.xs[i], k.dx[at], k.dx[1 - at])
+        at = 1 - at
+        i -= 1
+    linear_backward(k.dx[at], k.inputs, n.w(t.token_w), n.g(t.token_w), n.g(t.token_b), none(), rows, TokenInputs, d)
+    run_column_sums(count, 64 * d, k.dx[at], n.g(t.pos))
+
+# The logits of the first count rows in n.rows.
+fn time_forward(n: *TimeNet, count: int)
+    let t = n.layout
+    let cfg = t.cfg
+    let z = cfg.joined()
+    launch(&kernels, blocks_for(count, 64), 64, 0, gpu_args(time_inputs, count, n.rows, cfg.groups, n.x, z, n.hot))
+    if cfg.embed > 0
+        linear(n.hot, n.w(t.embed_w), n.w(t.embed_b), n.e0, count, HotFeatures, cfg.embed)
+        launch(&kernels, blocks_for(count as i64 * cfg.embed, 256), 256, 0, gpu_args(silu_columns, count, z, DenseFeatures, cfg.embed, n.e0, n.x))
+    if cfg.trunk > 0: trunk_forward(n, count)
+    linear(n.x, n.w(t.w1), n.w(t.b1), n.h1, count, z, cfg.hidden1)
+    run_silu(count as i64 * cfg.hidden1, n.h1, n.a1)
+    linear(n.a1, n.w(t.w2), n.w(t.b2), n.h2, count, cfg.hidden1, cfg.hidden2)
+    run_silu(count as i64 * cfg.hidden2, n.h2, n.a2)
+    linear(n.a2, n.w(t.w3), n.w(t.b3), n.logits, count, cfg.hidden2, TimeBins)
+
+# The losses of the logits time_forward left, with every parameter's gradient of their mean over
+# the count rows in n.grads. Returns the sums over the rows of the cross-entropy against the real
+# bin and of the divergence from the full net, in nats.
+fn time_backward(n: *TimeNet, count: int, distill: f32, host_loss: *f32) -> (f64, f64)
+    let t = n.layout
+    let cfg = t.cfg
+    let z = cfg.joined()
+    device_zero(n.grads)
+    launch(&kernels, blocks_for(count, 128), 128, 0, gpu_args(time_net_loss, count, n.rows, n.logits, distill, 1.0 / count as f32, n.dlogits, n.loss))
+    linear_backward(n.dlogits, n.a2, n.w(t.w3), n.g(t.w3), n.g(t.b3), n.da2, count, cfg.hidden2, TimeBins)
+    run_silu_back(count as i64 * cfg.hidden2, n.h2, n.da2, n.da2)
+    linear_backward(n.da2, n.a1, n.w(t.w2), n.g(t.w2), n.g(t.b2), n.da1, count, cfg.hidden1, cfg.hidden2)
+    run_silu_back(count as i64 * cfg.hidden1, n.h1, n.da1, n.da1)
+    linear_backward(n.da1, n.x, n.w(t.w1), n.g(t.w1), n.g(t.b1), n.dx, count, z, cfg.hidden1)
+    if cfg.embed > 0
+        launch(&kernels, blocks_for(count as i64 * cfg.embed, 256), 256, 0, gpu_args(silu_columns_back, count, z, DenseFeatures, cfg.embed, n.e0, n.dx, n.de0))
+        linear_backward(n.de0, n.hot, n.w(t.embed_w), n.g(t.embed_w), n.g(t.embed_b), none(), count, HotFeatures, cfg.embed)
+    if cfg.trunk > 0: trunk_backward(n, count)
+    download(host_loss, n.loss, count as i64 * 8)
+    var hard: f64 = 0.0
+    var soft: f64 = 0.0
+    for i in 0..count
+        hard += host_loss[2 * i] as f64
+        soft += host_loss[2 * i + 1] as f64
+    return hard, soft
+
+# ---- on the CPU ----------------------------------------------------------------------------------
+
+fn silu64(x: f64) -> f64
+    return x / (1.0 + exp(-x))
+
+# y = x w^T + b for one row: x[k], w [n][k] and b [n] in the parameters, y[n].
+fn linear64(params: *f32, w: i64, b: i64, x: *f64, k: int, n: int, y: *f64)
+    for j in 0..n
+        var s = params[b + j] as f64
+        let row = params + w + j as i64 * k
+        for i in 0..k
+            s += row[i] as f64 * x[i]
+        y[j] = s
+
+# y = the layer norm of x[d] times (1 + scale) plus shift, scale and shift in the parameters.
+fn norm64(params: *f32, x: *f64, d: int, scale: i64, shift: i64, y: *f64)
+    var mean = 0.0
+    for j in 0..d
+        mean += x[j]
+    mean /= d as f64
+    var variance = 0.0
+    for j in 0..d
+        variance += (x[j] - mean) * (x[j] - mean)
+    let inv = 1.0 / sqrt(variance / d as f64 + NormEps as f64)
+    for j in 0..d
+        y[j] = (x[j] - mean) * inv
+        if scale >= 0: y[j] = y[j] * (1.0 + params[scale + j] as f64) + params[shift + j] as f64
+
+# The trunk's outputs for one position on the CPU, in f64: out[64 * trunk_out].
+fn trunk64(t: *TimeLayout, params: *f32, hot: *f32, out: *f64)
+    let cfg = t.cfg
+    let d = cfg.trunk
+    let heads = cfg.trunk_heads
+    let dh = d / heads
+    let x = alloc[f64](64 * d)
+    let y = alloc[f64](64 * d)
+    let qkv = alloc[f64](64 * 3 * d)
+    let att = alloc[f64](64 * d)
+    let o = alloc[f64](d)
+    let hidden = alloc[f64](4 * d)
+    var inputs: [TokenInputs]f64
+    var scores: [64]f64
+    for sq in 0..64
+        for f in 0..TokenInputs
+            inputs[f] = (f < 12 ? hot[HotSquares + sq * 12 + f] : hot[HotLast + (f - 12) * 64 + sq]) as f64
+        linear64(params, t.token_w, t.token_b, &inputs[0], TokenInputs, d, x + sq * d)
+        for j in 0..d
+            x[sq * d + j] += params[t.pos + sq * d + j] as f64
+    for layer in 0..cfg.trunk_layers
+        let b = &t.blocks[layer]
+        # With a zero condition, the block's scales, shifts and gates are ada's biases:
+        # s1, b1, g1, s2, b2, g2, d of each.
+        for sq in 0..64
+            norm64(params, x + sq * d, d, b.ada_b, b.ada_b + d, y + sq * d)
+            linear64(params, b.qkv_w, b.qkv_b, y + sq * d, d, 3 * d, qkv + sq * 3 * d)
+        for h in 0..heads
+            for i in 0..64
+                var most = -1.0e300
+                for j in 0..64
+                    var s = 0.0
+                    for e in 0..dh
+                        s += qkv[i * 3 * d + h * dh + e] * qkv[j * 3 * d + d + h * dh + e]
+                    scores[j] = s / sqrt(dh as f64) + params[b.rel + h * 225 + rel_index(i, j)] as f64
+                    most = max(most, scores[j])
+                var total = 0.0
+                for j in 0..64
+                    scores[j] = exp(scores[j] - most)
+                    total += scores[j]
+                for e in 0..dh
+                    var v = 0.0
+                    for j in 0..64
+                        v += scores[j] * qkv[j * 3 * d + 2 * d + h * dh + e]
+                    att[i * d + h * dh + e] = v / total
+        for sq in 0..64
+            linear64(params, b.out_w, b.out_b, att + sq * d, d, d, o)
+            for j in 0..d
+                x[sq * d + j] += params[b.ada_b + 2 * d + j] as f64 * o[j]
+            norm64(params, x + sq * d, d, b.ada_b + 3 * d, b.ada_b + 4 * d, y + sq * d)
+            linear64(params, b.ff1_w, b.ff1_b, y + sq * d, d, 4 * d, hidden)
+            for j in 0..4 * d
+                hidden[j] = hidden[j] * 0.5 * (1.0 + c_erf(hidden[j] * 0.70710678118654752))
+            linear64(params, b.ff2_w, b.ff2_b, hidden, 4 * d, d, o)
+            for j in 0..d
+                x[sq * d + j] += params[b.ada_b + 5 * d + j] as f64 * o[j]
+    for sq in 0..64
+        norm64(params, x + sq * d, d, -1, -1, y + sq * d)
+        linear64(params, t.token_out_w, t.token_out_b, y + sq * d, d, cfg.trunk_out, out + sq * cfg.trunk_out)
+    free(x)
+    free(y)
+    free(qkv)
+    free(att)
+    free(o)
+    free(hidden)
+
+# The logits of one row from parameters on the CPU, in f64: the reference the GPU's passes are
+# checked against, and what a program without a GPU computes.
+fn time_logits(t: *TimeLayout, params: *f32, row: *u8, out: *f64)
+    let cfg = t.cfg
+    let z = cfg.joined()
+    var dense: [DenseFeatures]f32
+    var hot: [HotFeatures]f32
+    time_features(row, cfg.groups, &dense[0], &hot[0])
+    let x = alloc[f64](z)
+    let a1 = alloc[f64](cfg.hidden1)
+    let a2 = alloc[f64](cfg.hidden2)
+    for j in 0..DenseFeatures
+        x[j] = dense[j] as f64
+    for j in 0..cfg.embed
+        var s = params[t.embed_b + j] as f64
+        let w = params + t.embed_w + j as i64 * HotFeatures
+        for k in 0..HotFeatures
+            if hot[k] != 0.0: s += w[k] as f64 * hot[k] as f64
+        x[DenseFeatures + j] = silu64(s)
+    if cfg.trunk > 0: trunk64(t, params, &hot[0], x + DenseFeatures + cfg.embed)
+    linear64(params, t.w1, t.b1, x, z, cfg.hidden1, a1)
+    for j in 0..cfg.hidden1
+        a1[j] = silu64(a1[j])
+    linear64(params, t.w2, t.b2, a1, cfg.hidden1, cfg.hidden2, a2)
+    for j in 0..cfg.hidden2
+        a2[j] = silu64(a2[j])
+    linear64(params, t.w3, t.b3, a2, cfg.hidden2, TimeBins, out)
+    free(x)
+    free(a1)
+    free(a2)
+
+# The loss of one row on the CPU, as time_net_loss mixes it: the cross-entropy against
+# (1 - distill) * the real bin + distill * the full net's distribution; 0 for rows that do not
+# count.
+fn time_row_loss(t: *TimeLayout, params: *f32, row: *u8, distill: f64) -> f64
+    let think = rec_u16(row, AtThink)
+    if think == NoClock or rec_u16(row, AtPly) < 2: return 0.0
+    var x: [TimeBins]f64
+    time_logits(t, params, row, &x[0])
+    var most = -1.0e300
+    var t_most = -1.0e300
+    for i in 0..TimeBins
+        most = max(most, x[i])
+        t_most = max(t_most, row_f32(row, AtTeacher + 4 * i) as f64)
+    var total = 0.0
+    var t_total = 0.0
+    for i in 0..TimeBins
+        total += exp(x[i] - most)
+        t_total += exp(row_f32(row, AtTeacher + 4 * i) as f64 - t_most)
+    let norm = log(total) + most
+    let target = time_bin(think)
+    let share = row_f32(row, AtLegalCount) > 0.0 ? distill : 0.0
+    var loss = 0.0
+    for i in 0..TimeBins
+        let teacher = exp(row_f32(row, AtTeacher + 4 * i) as f64 - t_most) / t_total
+        let y = (1.0 - share) * (i == target ? 1.0 : 0.0) + share * teacher
+        loss -= y * (x[i] - norm)
+    return loss

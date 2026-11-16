@@ -1,0 +1,62 @@
+# ganglia quantize: a net's file with its parameters in fewer bits (quantized.snail has the
+# format). It works on a move net (.gnet) and on a think-time net (.tnet), drops a checkpoint's
+# AdamW state, and says how far the stored parameters are from the net's own.
+
+use base/sys
+use base/stream
+use model
+use checkpoint
+use quantized
+use timenet
+
+fn quantize_net(source: str, target: str, bits: int) -> bool
+    if bits != 16 and (bits < 2 or bits > 8): fail2("--bits is 16, or 2 to 8: ", source)
+    let raw = read_whole(source)
+    if is_quantized(raw): fail2("already a quantized net: ", source)
+    var layout: *Layout = null
+    var header: []u8
+    var params: *f32 = null
+    if raw.len >= 8 and raw[0..8] as str == "GANGLIA2"
+        var ck = load_checkpoint(source)
+        layout = layout_of(ck.cfg)
+        params = ck.params
+        let own = alloc[u8](128)
+        copy(own, raw.ptr, 128)
+        put_i64(own + 56, 0)
+        header = own[0..128]
+    elif raw.len >= 8 and raw[0..8] as str == "GTIMENET"
+        let (t, p) = load_time_net(source)
+        layout = t.opt
+        params = p
+        header = raw[0..64]
+    else
+        fail2("neither a move net (.gnet) nor a think-time net (.tnet): ", source)
+
+    var tensors: [..]QuantTensor
+    var whole: i64 = 0
+    for i in 0..layout.params.len
+        let p = &layout.params[i]
+        tensors.push(QuantTensor(count: p.count, rows: p.rows))
+        if p.rows > 0: whole += p.count
+    let out = quantized(header, params, tensors, bits)
+    var (f, ok) = create_file(target)
+    if not ok or not f.write(out): fail2("cannot write ", target)
+    f.close()
+
+    # How far the stored parameters are from the net's own: the root mean square of the
+    # differences over that of the parameters, and the largest difference.
+    let back = unquantized(out, target)
+    let stored = (back.ptr + header.len) as *f32
+    var diff: f64 = 0.0
+    var size: f64 = 0.0
+    var worst: f64 = 0.0
+    for i in 0..layout.total
+        let d = (stored[i] - params[i]) as f64
+        diff += d * d
+        size += params[i] as f64 * params[i] as f64
+        worst = max(worst, abs(d))
+    let plain = header.len as i64 + layout.total * 4
+    let kind = bits == 16 ? "half floats" : "integers"
+    print("{target}: {bits}-bit {kind}, {out.len} bytes where f32 takes {plain} ({plain as f64 / out.len as f64:.2} times smaller); {100.0 * whole as f64 / layout.total as f64:.1}% of the parameters are weights stored as integers")
+    print("  parameters off by {100.0 * sqrt(diff / max(size, 1.0e-30)):.3}% (root mean square, of theirs), at most {worst:.2e}")
+    return true

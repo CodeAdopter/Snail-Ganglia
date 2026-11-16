@@ -1,0 +1,488 @@
+# Scores think-time predictions against real think times, as the Python project's
+# time_compare.py and time_detail.py do: blitz and rapid positions of a test time set with a think
+# time, from each side's second move on, grouped by time control; and bullet positions the same
+# way, which the Python project's scripts leave out. Classical positions are scored too, for
+# write_row_probs, though they belong to none of the groups. The reported scores use the rows
+# at even places in the test file (time_compare.py's every 2nd record); the rows at odd places are
+# left for choosing between nets while training.
+#
+# A model is scored by its log loss in bits per move: -log2 of the probability it gave the bin of
+# the real think time, floored at 1e-4. Beside the nets stand two models without a net: the
+# sampler of Mobile Maia (lib/src/human_timing.dart), which ignores the position, and the real
+# distribution of each time-control group, which knows nothing else.
+
+use base/sys
+use base/stream
+use base/mem
+use model
+use checkpoint
+use timeset
+use timenet
+use kernels/records
+use kernels/heads
+use kernels/timefeat
+
+const TimeGroups = 6
+const TimeGroupNames = ["3+0 and 3+2 blitz", "5+0 and 5+3 blitz", "10+0 rapid", "15+10 rapid", "1+0 bullet", "2+1 bullet"]
+const LossFloor = 0.0001
+
+# The time-control group of a record, -1 for another time control.
+fn time_group(r: *u8) -> int
+    let base = rec_u16(r, AtBase)
+    let inc = rec_u16(r, AtIncrement)
+    if base == 180 and (inc == 0 or inc == 2): return 0
+    if base == 300 and (inc == 0 or inc == 3): return 1
+    if base == 600 and inc == 0: return 2
+    if base == 900 and inc == 10: return 3
+    if base == 60 and inc == 0: return 4
+    if base == 120 and inc == 1: return 5
+    return -1
+
+# The rows of a test time set that are scored, copied next to each other.
+struct EvalSet
+    rows: *u8
+    count: i64
+    group: *i8                  # each row's time_group
+    bin: *u8                    # the bin of its real think time
+    seconds: *u16               # its real think time
+    index: *i64                 # its place in the test file
+
+    fn row(i: i64) -> *u8
+        return rows + i * TimeRow
+
+# The scored rows at even places of set, or at odd places.
+fn eval_set(set: *TimeSet, even: bool) -> *EvalSet
+    let e = new EvalSet
+    let first: i64 = even ? 0 : 1
+    var n: i64 = 0
+    for pass in 0..2
+        if pass == 1
+            e.rows = alloc[u8](n * TimeRow)
+            e.group = alloc[i8](n)
+            e.bin = alloc[u8](n)
+            e.seconds = alloc[u16](n)
+            e.index = alloc[i64](n)
+            e.count = n
+            n = 0
+        var i = first
+        while i < set.count
+            let r = set.row(i)
+            let speed = r[AtSpeed] as int
+            if speed >= 1 and speed <= 4 and timed(r, false)
+                if pass == 1
+                    copy(e.rows + n * TimeRow, r, TimeRow)
+                    e.group[n] = time_group(r) as i8
+                    e.index[n] = i
+                    e.seconds[n] = rec_u16(r, AtThink) as u16
+                    e.bin[n] = time_bin(rec_u16(r, AtThink)) as u8
+                n += 1
+            i += 2
+    return e
+
+fn softmax_row(logits: *f32, out: *f32)
+    var most = -1.0e300
+    for i in 0..TimeBins
+        most = max(most, logits[i] as f64)
+    var total = 0.0
+    for i in 0..TimeBins
+        total += exp(logits[i] as f64 - most)
+    for i in 0..TimeBins
+        out[i] = (exp(logits[i] as f64 - most) / total) as f32
+
+# The net's distribution over the bins for every row of e: [count][TimeBins].
+fn net_probs(n: *TimeNet, e: *EvalSet) -> *f32
+    let probs = alloc[f32](e.count * TimeBins)
+    let logits = alloc[f32](n.batch as i64 * TimeBins)
+    var at: i64 = 0
+    while at < e.count
+        let count = min(n.batch as i64, e.count - at) as int
+        upload(n.rows, e.row(at), count as i64 * TimeRow)
+        time_forward(n, count)
+        download(logits, n.logits, count as i64 * TimeBins * 4)
+        for i in 0..count
+            softmax_row(logits + i * TimeBins, probs + (at + i) * TimeBins)
+        at += count
+    free(logits)
+    return probs
+
+# The full net's distribution for every row of e, from the logits the rows carry.
+fn teacher_probs(e: *EvalSet) -> *f32
+    let probs = alloc[f32](e.count * TimeBins)
+    var logits: [TimeBins]f32
+    for i in 0..e.count
+        for j in 0..TimeBins
+            logits[j] = row_f32(e.row(i), AtTeacher + 4 * j)
+        softmax_row(&logits[0], probs + i * TimeBins)
+    return probs
+
+# The log loss in bits per move of probs on the rows of a group (-1 for every row), and the number
+# of rows.
+fn log_loss_bits(probs: *f32, e: *EvalSet, group: int) -> (f64, i64)
+    var sum = 0.0
+    var n: i64 = 0
+    for i in 0..e.count
+        if group >= 0 and e.group[i] as int != group: continue
+        sum -= log2(max(probs[i * TimeBins + e.bin[i]] as f64, LossFloor))
+        n += 1
+    return n > 0 ? sum / n as f64 : 0.0, n
+
+# The four groups' log losses on one line, and the first group's.
+fn loss_line(probs: *f32, e: *EvalSet) -> (str, f64)
+    var text: [..]u8
+    var first = 0.0
+    for g in 0..TimeGroups
+        let (bits, n) = log_loss_bits(probs, e, g)
+        if g == 0: first = bits
+        var buffer: [96]u8
+        let part = format(&buffer, "{g > 0 ? "  " : ""}{TimeGroupNames[g]} {bits:.4}")
+        for i in 0..part.len
+            text.push(part[i])
+    return text[0..text.len] as str, first
+
+# ---- the models without a net --------------------------------------------------------------------
+
+# Mobile Maia's think time for a move, in seconds (its human_timing.dart): log-normal around
+# 1.65 s within 0.55 to 4.5 s, a pause of 1.5 to 4.5 s more on 6% of the moves, and faster in the
+# fastest time controls.
+fn maia_think(rng: *Random, base: int, inc: int) -> f64
+    let u1 = max(rng.unit(), 0.000001)
+    let u2 = rng.unit()
+    let g = sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2)
+    var s = clamp(exp(0.50 + g * 0.44), 0.55, 4.5)
+    let pause = rng.unit() < 0.06
+    let extra = 1.5 + rng.unit() * 3.0
+    if pause: s += extra
+    if base == 60 and inc == 0
+        s = min(s / 2.0, 3.0)
+    elif (base == 120 and inc == 1) or (base == 180 and (inc == 0 or inc == 2))
+        s = min(s * 0.75, 4.5)
+    return s
+
+# The distribution over the bins of Mobile Maia's sampler for a time control, recorded in whole
+# seconds as Lichess records think times, and its mean in seconds.
+fn maia_bins(base: int, inc: int, out: *f64) -> f64
+    var rng = Random(state: 1)
+    let draws = 2000000
+    var total = 0.0
+    for i in 0..TimeBins
+        out[i] = 0.0
+    for i in 0..draws
+        # Rounded as time_compare.py rounds, a half to the even second: the sampler's cap of 4.5 s
+        # is then 4 s, never 5.
+        let t = maia_think(&rng, base, inc)
+        var s = floor(t + 0.5)
+        if s - t == 0.5 and fmod(s, 2.0) != 0.0: s -= 1.0
+        out[time_bin(s as int)] += 1.0
+        total += s
+    for i in 0..TimeBins
+        out[i] /= draws as f64
+    return total / draws as f64
+
+# The mean recorded think time of each bin, for a distribution's mean in seconds: the whole
+# seconds that fall in the bin, and 200 s for the open last bin.
+fn bin_means(out: *f64)
+    var sums: [TimeBins]f64
+    var counts: [TimeBins]f64
+    for s in 0..4001
+        let b = time_bin(s)
+        sums[b] += s as f64
+        counts[b] += 1.0
+    for b in 0..TimeBins
+        out[b] = counts[b] > 0.0 ? sums[b] / counts[b] : pow(2.0, (b as f64 - 0.5) / 4.0)
+    out[TimeBins - 1] = 200.0
+
+# ---- rank correlation ----------------------------------------------------------------------------
+
+# Sorts order[0..n], indices into keys, by key, with scratch of the same size.
+fn sort_by_key(keys: *f64, order: *i64, scratch: *i64, n: i64)
+    var from = order
+    var to = scratch
+    var width: i64 = 1
+    while width < n
+        var lo: i64 = 0
+        while lo < n
+            let mid = min(lo + width, n)
+            let hi = min(lo + 2 * width, n)
+            var i = lo
+            var j = mid
+            var k = lo
+            while i < mid and j < hi
+                if keys[from[j]] < keys[from[i]]
+                    to[k] = from[j]
+                    j += 1
+                else
+                    to[k] = from[i]
+                    i += 1
+                k += 1
+            while i < mid
+                to[k] = from[i]
+                i += 1
+                k += 1
+            while j < hi
+                to[k] = from[j]
+                j += 1
+                k += 1
+            lo += 2 * width
+        let t = from
+        from = to
+        to = t
+        width *= 2
+    if from != order
+        for i in 0..n
+            order[i] = from[i]
+
+# The ranks of n values, equal values sharing the mean of their ranks.
+fn ranks_of(values: *f64, n: i64) -> *f64
+    let order = alloc[i64](n)
+    let scratch = alloc[i64](n)
+    for i in 0..n
+        order[i] = i
+    sort_by_key(values, order, scratch, n)
+    let ranks = alloc[f64](n)
+    var i: i64 = 0
+    while i < n
+        var j = i
+        while j + 1 < n and values[order[j + 1]] == values[order[i]]
+            j += 1
+        let rank = (i + j) as f64 / 2.0
+        for k in i..j + 1
+            ranks[order[k]] = rank
+        i = j + 1
+    free(order)
+    free(scratch)
+    return ranks
+
+# Spearman's rank correlation of two lists of n values.
+fn rank_correlation(a: *f64, b: *f64, n: i64) -> f64
+    if n < 2: return 0.0
+    let ra = ranks_of(a, n)
+    let rb = ranks_of(b, n)
+    let mean = (n - 1) as f64 / 2.0
+    var ab = 0.0
+    var aa = 0.0
+    var bb = 0.0
+    for i in 0..n
+        let x = ra[i] - mean
+        let y = rb[i] - mean
+        ab += x * y
+        aa += x * x
+        bb += y * y
+    free(ra)
+    free(rb)
+    return aa > 0.0 and bb > 0.0 ? ab / sqrt(aa * bb) : 0.0
+
+# ---- the report ----------------------------------------------------------------------------------
+
+# A net's distributions over the rows of an EvalSet, under a name.
+struct Scored
+    name: str
+    probs: *f32
+
+const Octaves = 8
+const OctaveNames = ["<1 s", "1 s", "2-3 s", "4-7 s", "8-15 s", "16-31 s", "32-63 s", "64 s+"]
+
+# The octave of a bin: under 1 s, 1 s, 2-3 s, and so on up to 64 s and over.
+fn octave_of(bin: int) -> int
+    if bin == 0: return 0
+    return min(1 + (bin - 1) / 4, Octaves - 1)
+
+const ClockBuckets = 7
+const ClockFrom = [150, 90, 60, 30, 15, 5, 0]
+const ClockNames = ["2.5 min+", "90-150 s", "60-90 s", "30-60 s", "15-30 s", "5-15 s", "<5 s"]
+
+fn clock_bucket(seconds: int) -> int
+    for i in 0..ClockBuckets
+        if seconds >= ClockFrom[i]: return i
+    return ClockBuckets - 1
+
+const MeanBuckets = 6
+const MeanFrom = [0.0, 1.5, 2.5, 4.0, 6.0, 10.0]
+const MeanNames = ["<1.5 s", "1.5-2.5 s", "2.5-4 s", "4-6 s", "6-10 s", "10 s+"]
+
+fn mean_bucket(seconds: f64) -> int
+    var b = 0
+    for i in 1..MeanBuckets
+        if seconds >= MeanFrom[i]: b = i
+    return b
+
+# Prints the scores of the scored nets on e, and writes the numbers behind the four charts to
+# json unless it is empty.
+fn time_report(e: *EvalSet, scored: []Scored, json: str)
+    var means: [TimeBins]f64
+    bin_means(&means[0])
+    var out: Text
+    var buffer: [512]u8
+    out.add("\{\n \"groups\": [")
+    print("log loss in bits per move (lower is better), on the scored rows at even places of the test file")
+    write("{"time control":-20}{"moves":9}")
+    for s in scored
+        write("{s.name:14}")
+    print("{"Mobile Maia":14}{"real spread":14}")
+    for g in 0..TimeGroups
+        var n: i64 = 0
+        var base = 0
+        var inc = 0
+        var real: [TimeBins]f64
+        for i in 0..e.count
+            if e.group[i] as int != g: continue
+            real[e.bin[i]] += 1.0
+            if n == 0
+                base = rec_u16(e.row(i), AtBase)
+                inc = rec_u16(e.row(i), AtIncrement)
+            n += 1
+        if n == 0: continue
+        for b in 0..TimeBins
+            real[b] /= n as f64
+        var maia: [TimeBins]f64
+        maia_bins(base, inc, &maia[0])
+        var maia_loss = 0.0
+        var real_loss = 0.0
+        var long_real = 0.0
+        for i in 0..e.count
+            if e.group[i] as int != g: continue
+            maia_loss -= log2(max(maia[e.bin[i]], LossFloor))
+            real_loss -= log2(max(real[e.bin[i]], LossFloor))
+            if e.seconds[i] >= 8: long_real += 1.0
+        write("{TimeGroupNames[g]:-20}{n:9}")
+        out.add(format(&buffer, "{g > 0 ? "," : ""}\n  \{\"name\": \"{TimeGroupNames[g]}\", \"moves\": {n}, \"loss\": \{"))
+        for s in scored
+            let (bits, _) = log_loss_bits(s.probs, e, g)
+            write("{bits:14.4}")
+            out.add(format(&buffer, "\"{s.name}\": {bits:.4}, "))
+        print("{maia_loss / n as f64:14.4}{real_loss / n as f64:14.4}")
+        out.add(format(&buffer, "\"Mobile Maia\": {maia_loss / n as f64:.4}, \"real spread\": {real_loss / n as f64:.4}\},"))
+        # The share of long thinks: 8 s and over is bin 13 and up.
+        var long_maia = 0.0
+        for b in 13..TimeBins
+            long_maia += maia[b]
+        out.add(format(&buffer, "\n   \"long\": \{\"Real games\": {long_real / n as f64:.4}, "))
+        for s in scored
+            var share = 0.0
+            for i in 0..e.count
+                if e.group[i] as int != g: continue
+                for b in 13..TimeBins
+                    share += s.probs[i * TimeBins + b] as f64
+            out.add(format(&buffer, "\"{s.name}\": {share / n as f64:.4}, "))
+        out.add(format(&buffer, "\"Mobile Maia\": {long_maia:.4}\},"))
+        # How long moves take, by octave.
+        out.add("\n   \"octaves\": \{\"Real games\": [")
+        var octaves: [Octaves]f64
+        for b in 0..TimeBins
+            octaves[octave_of(b)] += real[b]
+        for o in 0..Octaves
+            out.add(format(&buffer, "{o > 0 ? ", " : ""}{octaves[o]:.4}"))
+        for s in scored
+            for o in 0..Octaves
+                octaves[o] = 0.0
+            for i in 0..e.count
+                if e.group[i] as int != g: continue
+                for b in 0..TimeBins
+                    octaves[octave_of(b)] += s.probs[i * TimeBins + b] as f64
+            out.add(format(&buffer, "], \"{s.name}\": ["))
+            for o in 0..Octaves
+                out.add(format(&buffer, "{o > 0 ? ", " : ""}{octaves[o] / n as f64:.4}"))
+        for o in 0..Octaves
+            octaves[o] = 0.0
+        for b in 0..TimeBins
+            octaves[octave_of(b)] += maia[b]
+        out.add("], \"Mobile Maia\": [")
+        for o in 0..Octaves
+            out.add(format(&buffer, "{o > 0 ? ", " : ""}{octaves[o]:.4}"))
+        out.add("]\}\}")
+    out.add("\n ],")
+
+    # The first group in detail: each net's mean prediction against the real think time.
+    let maia_mean = maia_bins(180, 0, &means[0])
+    bin_means(&means[0])
+    var n0: i64 = 0
+    for i in 0..e.count
+        if e.group[i] == 0: n0 += 1
+    let seconds = alloc[f64](max(n0, 1))
+    let predicted = alloc[f64](max(n0, 1))
+    let clocks = alloc[int](max(n0, 1))
+    print("")
+    print("{TimeGroupNames[0]}, {n0} moves: the mean of each net's prediction against the real think time")
+    out.add(format(&buffer, "\n \"octave_names\": ["))
+    for o in 0..Octaves
+        out.add(format(&buffer, "{o > 0 ? ", " : ""}\"{OctaveNames[o]}\""))
+    out.add(format(&buffer, "],\n \"maia_mean\": {maia_mean:.4},\n \"detail\": ["))
+    var which = 0
+    for s in scored
+        var k: i64 = 0
+        for i in 0..e.count
+            if e.group[i] != 0: continue
+            var m = 0.0
+            for b in 0..TimeBins
+                m += s.probs[i * TimeBins + b] as f64 * means[b]
+            seconds[k] = e.seconds[i] as f64
+            predicted[k] = m
+            clocks[k] = rec_u16(e.row(i), AtOwnClock)
+            k += 1
+        let rho = rank_correlation(seconds, predicted, n0)
+        print("{s.name}: rank correlation {rho:.4}")
+        out.add(format(&buffer, "{which > 0 ? "," : ""}\n  \{\"name\": \"{s.name}\", \"rank_correlation\": {rho:.4},\n   \"by_clock\": ["))
+        which += 1
+        print("  {"clock left":-12}{"moves":9}{"real":9}{"net":9}")
+        for c in 0..ClockBuckets
+            var real_sum = 0.0
+            var net_sum = 0.0
+            var count: i64 = 0
+            for j in 0..n0
+                if clock_bucket(clocks[j]) != c: continue
+                real_sum += seconds[j]
+                net_sum += predicted[j]
+                count += 1
+            let d = max(count, 1) as f64
+            print("  {ClockNames[c]:-12}{count:9}{real_sum / d:9.2}{net_sum / d:9.2}")
+            out.add(format(&buffer, "{c > 0 ? ", " : ""}\{\"label\": \"{ClockNames[c]}\", \"n\": {count}, \"real\": {real_sum / d:.3}, \"net\": {net_sum / d:.3}\}"))
+        out.add("],\n   \"by_prediction\": [")
+        print("  {"predicted":-12}{"moves":9}{"real":9}{"net":9}")
+        for c in 0..MeanBuckets
+            var real_sum = 0.0
+            var net_sum = 0.0
+            var count: i64 = 0
+            for j in 0..n0
+                if mean_bucket(predicted[j]) != c: continue
+                real_sum += seconds[j]
+                net_sum += predicted[j]
+                count += 1
+            let d = max(count, 1) as f64
+            print("  {MeanNames[c]:-12}{count:9}{real_sum / d:9.2}{net_sum / d:9.2}")
+            out.add(format(&buffer, "{c > 0 ? ", " : ""}\{\"label\": \"{MeanNames[c]}\", \"n\": {count}, \"real\": {real_sum / d:.3}, \"net\": {net_sum / d:.3}\}"))
+        out.add("]\}")
+    out.add("\n ]\n\}\n")
+    if json.len > 0
+        if not write_text(json, out.view()): fail2("cannot write ", json)
+
+# Writes, for every scored row, its place in the test file (i32) and the probability each scored
+# net gave the bin of its real think time (f32 each), for looking into where two nets differ.
+fn write_row_scores(e: *EvalSet, scored: []Scored, path: str)
+    var (f, ok) = create_file(path)
+    if not ok: fail2("cannot write ", path)
+    let width = 4 + 4 * scored.len
+    let out = alloc[u8](e.count * width)
+    for i in 0..e.count
+        let at = out + i * width
+        put_i32(at, e.index[i] as int)
+        for k in 0..scored.len
+            put_i32(at + 4 + 4 * k, scored[k].probs[i * TimeBins + e.bin[i]].bits as int)
+    f.write(out[0..e.count * width])
+    f.close()
+    free(out)
+
+# Writes, for every scored row, its place in the test file (i32) and each scored net's whole
+# distribution over the bins (TimeBins f32 a net), for scores this file does not compute, such as
+# those of each time class.
+fn write_row_probs(e: *EvalSet, scored: []Scored, path: str)
+    var (f, ok) = create_file(path)
+    if not ok: fail2("cannot write ", path)
+    let width = 4 + 4 * TimeBins * scored.len
+    let out = alloc[u8](e.count * width)
+    for i in 0..e.count
+        let at = out + i * width
+        put_i32(at, e.index[i] as int)
+        for k in 0..scored.len
+            copy(at + 4 + 4 * TimeBins * k, (scored[k].probs + i * TimeBins) as *u8, 4 * TimeBins)
+    f.write(out[0..e.count * width])
+    f.close()
+    free(out)

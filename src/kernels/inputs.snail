@@ -1,0 +1,190 @@
+# The net's inputs, read straight from the records on the GPU: the condition vector's inputs
+# (net.Condition, before its MLP) and the square tokens' features (net.Net.tokens), with the
+# backward pass of the condition's embeddings.
+
+use cuda/driver
+use model
+use kernels/records
+use kernels/gemm
+use kernels/layers
+
+# Where x falls on knots 0 .. n-1 (net.Knots): the knot below it and the weight of the one above.
+fn knot_at(n: int, x: f32) -> (int, f32)
+    let top = ((n - 1) as f64 - 0.0001) as f32
+    let xc = clamp(x, 0.0, top)
+    let i = floor(xc) as int
+    return i, xc - i as f32
+
+# Column j of a piecewise-linear embedding on knots 0 .. n-1, table [groups][n][dc].
+fn knot(table: *f32, n: int, dc: int, j: int, x: f32, group: int) -> f32
+    let (i, t) = knot_at(n, x)
+    let a = table + ((group * n + i) * dc + j)
+    return (1.0 - t) * a[0] + t * a[dc]
+
+# Adds g to column j of knot's gradient: (1 - t) g to the knot below x and t g to the one above.
+fn knot_back(grad: *f32, n: int, dc: int, j: int, x: f32, group: int, g: f32)
+    let (i, t) = knot_at(n, x)
+    let a = grad + ((group * n + i) * dc + j)
+    atomic_add(&a[0], (1.0 - t) * g)
+    atomic_add(&a[dc], t * g)
+
+# The rating and clock tables a time class uses: bullet and faster share blitz's (net.SPEED_GROUP_V1,
+# for nets trained without bullet games), or with bullet != 0 have the first table to themselves
+# (net.SPEED_GROUP; Config.bullet_tables).
+fn speed_group(speed: int, bullet: int) -> int
+    if speed <= 1 and bullet != 0: return 0
+    return speed <= 2 ? 1 : speed == 3 ? 2 : 3
+
+fn log2_clock(seconds: int) -> f32
+    return log2(max(seconds, 1) as f32)
+
+fn log2_think(seconds: int) -> f32
+    return log2(1.0 + min(seconds, 4000) as f32)
+
+fn rating_knot(rating: int) -> f32
+    return (rating as f32 - 600.0) / 100.0
+
+# Increment buckets (net.Condition): 0 s, 1, 2, 3-4, 5-9, 10-14, 15-19, 20-29, 30-59, 60 and over.
+fn increment_bucket(seconds: int) -> int
+    var b = 0
+    if seconds >= 1: b += 1
+    if seconds >= 2: b += 1
+    if seconds >= 3: b += 1
+    if seconds >= 5: b += 1
+    if seconds >= 10: b += 1
+    if seconds >= 15: b += 1
+    if seconds >= 20: b += 1
+    if seconds >= 30: b += 1
+    if seconds >= 60: b += 1
+    return b
+
+# Berserk (net.Condition): 1 when the mover started below 3/4 of the base time, plus 2 when the
+# opponent did.
+fn berserk_of(r: *u8) -> int
+    let base = rec_u16(r, AtBase) as f32
+    var b = 0
+    if (rec_u16(r, AtOwnStart) as f32) < 0.75 * base: b += 1
+    if (rec_u16(r, AtOppStart) as f32) < 0.75 * base: b += 2
+    return b
+
+# One block per position, one thread per column of the condition vector. known[p] says whether
+# position p is given its own think time. The terms are added in net.Condition's order.
+@kernel
+fn condition_inputs(count: int, dc: int, bullet: int, records: *u8, known: *u8, own_rating: *f32, opp_rating: *f32, own_clock: *f32, opp_clock: *f32, think: *f32, opp_think: *f32, ply: *f32, think_unknown: *f32, increment: *f32, berserk: *f32, kind: *f32, speed: *f32, out: *f32)
+    let p = block_index().x
+    let j = thread_index().x
+    if p >= count or j >= dc: return
+    let r = records + p as i64 * Record
+    let sp = min(r[AtSpeed] as int, 5)
+    let g = speed_group(sp, bullet)
+    var c = knot(own_rating, 23, dc, j, rating_knot(rec_u16(r, AtOwnRating)), g)
+    c = c + knot(opp_rating, 23, dc, j, rating_knot(rec_u16(r, AtOppRating)), g)
+    c = c + knot(own_clock, 12, dc, j, log2_clock(rec_u16(r, AtOwnClock)), g)
+    c = c + knot(opp_clock, 12, dc, j, log2_clock(rec_u16(r, AtOppClock)), g)
+    c = c + (known[p] != 0 ? knot(think, 12, dc, j, log2_think(rec_u16(r, AtThink)), 0) : think_unknown[j])
+    let ot = rec_u16(r, AtOppThink)
+    c = c + (ot != NoClock ? knot(opp_think, 12, dc, j, log2_think(ot), 0) : think_unknown[j])
+    c = c + knot(ply, 21, dc, j, rec_u16(r, AtPly) as f32 / 10.0, 0)
+    c = c + increment[increment_bucket(rec_u16(r, AtIncrement)) * dc + j]
+    c = c + berserk[berserk_of(r) * dc + j]
+    c = c + kind[min(r[AtKind] as int, 3) * dc + j]
+    c = c + speed[sp * dc + j]
+    out[p as i64 * dc + j] = c
+
+# The backward pass of condition_inputs for the gradient dc0 of its output: adds each term's
+# gradient to the tables and embeddings it read, in the gradient buffer (same layout).
+@kernel
+fn condition_back(count: int, dc: int, bullet: int, records: *u8, known: *u8, dc0: *f32, own_rating: *f32, opp_rating: *f32, own_clock: *f32, opp_clock: *f32, think: *f32, opp_think: *f32, ply: *f32, think_unknown: *f32, increment: *f32, berserk: *f32, kind: *f32, speed: *f32)
+    let p = block_index().x
+    let j = thread_index().x
+    if p >= count or j >= dc: return
+    let r = records + p as i64 * Record
+    let g = dc0[p as i64 * dc + j]
+    let sp = min(r[AtSpeed] as int, 5)
+    let group = speed_group(sp, bullet)
+    knot_back(own_rating, 23, dc, j, rating_knot(rec_u16(r, AtOwnRating)), group, g)
+    knot_back(opp_rating, 23, dc, j, rating_knot(rec_u16(r, AtOppRating)), group, g)
+    knot_back(own_clock, 12, dc, j, log2_clock(rec_u16(r, AtOwnClock)), group, g)
+    knot_back(opp_clock, 12, dc, j, log2_clock(rec_u16(r, AtOppClock)), group, g)
+    if known[p] != 0
+        knot_back(think, 12, dc, j, log2_think(rec_u16(r, AtThink)), 0, g)
+    else
+        atomic_add(&think_unknown[j], g)
+    let ot = rec_u16(r, AtOppThink)
+    if ot != NoClock
+        knot_back(opp_think, 12, dc, j, log2_think(ot), 0, g)
+    else
+        atomic_add(&think_unknown[j], g)
+    knot_back(ply, 21, dc, j, rec_u16(r, AtPly) as f32 / 10.0, 0, g)
+    atomic_add(&increment[increment_bucket(rec_u16(r, AtIncrement)) * dc + j], g)
+    atomic_add(&berserk[berserk_of(r) * dc + j], g)
+    atomic_add(&kind[min(r[AtKind] as int, 3) * dc + j], g)
+    atomic_add(&speed[sp * dc + j], g)
+
+# The input layer's features of each square (net.Net.tokens), one block per square of each
+# position and one thread per feature: the 9 boards' piece codes one-hot (14 each), en passant,
+# the 4 castling rights, the halfmove clock / 100 and the repetitions one-hot (3).
+@kernel
+fn token_features(records: *u8, features: *f32)
+    let row = block_index().x
+    let f = thread_index().x
+    if f >= Inputs: return
+    let r = records + (row / 64) as i64 * Record
+    let sq = row % 64
+    var v: f32 = 0.0
+    if f < 126
+        if rec_code(r, f / 14, sq) == f % 14: v = 1.0
+    elif f == 126
+        if r[AtEp] as int == sq: v = 1.0
+    elif f < 131
+        if (r[AtCastling] as int >> (f - 127)) & 1 != 0: v = 1.0
+    elif f == 131
+        v = r[AtHalfmove] as f32 / 100.0
+    elif min(r[AtRepeats] as int, 2) == f - 132
+        v = 1.0
+    features[row as i64 * Inputs + f] = v
+
+# token_features as bf16 for the bf16 pass, in rows of `stride` (Inputs rounded up to a multiple
+# of 8), zero past the features. All but the halfmove clock / 100 are 0 or 1.
+@kernel
+fn token_halves(records: *u8, stride: int, features: *bf16)
+    let row = block_index().x
+    let f = thread_index().x
+    if f >= stride: return
+    let r = records + (row / 64) as i64 * Record
+    let sq = row % 64
+    var v: f32 = 0.0
+    if f < 126
+        if rec_code(r, f / 14, sq) == f % 14: v = 1.0
+    elif f == 126
+        if r[AtEp] as int == sq: v = 1.0
+    elif f < 131
+        if (r[AtCastling] as int >> (f - 127)) & 1 != 0: v = 1.0
+    elif f == 131
+        v = r[AtHalfmove] as f32 / 100.0
+    elif f < Inputs and min(r[AtRepeats] as int, 2) == f - 132
+        v = 1.0
+    features[row as i64 * stride + f] = v as bf16
+
+fn run_token_halves(count: int, records: DeviceMemory, stride: int, features: DeviceMemory)
+    launch(&kernels, count * 64, 160, 0, gpu_args(token_halves, records, stride, features))
+
+fn run_condition_inputs(count: int, dc: int, records: DeviceMemory, known: DeviceMemory, params: DeviceMemory, l: *Layout, out: DeviceMemory)
+    launch(&kernels, count, dc, 0, gpu_args(condition_inputs, count, dc, l.cfg.bullet_tables ? 1 : 0, records, known,
+        floats(params, l.own_rating), floats(params, l.opp_rating), floats(params, l.own_clock),
+        floats(params, l.opp_clock), floats(params, l.think), floats(params, l.opp_think),
+        floats(params, l.ply), floats(params, l.think_unknown), floats(params, l.increment),
+        floats(params, l.berserk), floats(params, l.kind), floats(params, l.speed), out))
+
+fn run_condition_back(count: int, dc: int, records: DeviceMemory, known: DeviceMemory, dc0: DeviceMemory, grads: DeviceMemory, l: *Layout)
+    launch(&kernels, count, dc, 0, gpu_args(condition_back, count, dc, l.cfg.bullet_tables ? 1 : 0, records, known, dc0,
+        floats(grads, l.own_rating), floats(grads, l.opp_rating), floats(grads, l.own_clock),
+        floats(grads, l.opp_clock), floats(grads, l.think), floats(grads, l.opp_think),
+        floats(grads, l.ply), floats(grads, l.think_unknown), floats(grads, l.increment),
+        floats(grads, l.berserk), floats(grads, l.kind), floats(grads, l.speed)))
+
+# The square tokens: the input layer on each square's features, plus its position embedding.
+fn run_tokens(count: int, records: DeviceMemory, features: DeviceMemory, params: DeviceMemory, l: *Layout, d: int, out: DeviceMemory)
+    launch(&kernels, count * 64, 160, 0, gpu_args(token_features, records, features))
+    linear(features, floats(params, l.inp_w), floats(params, l.inp_b), out, count * 64, Inputs, d)
+    run_add_rows(count * 64, d, 64, out, floats(params, l.pos))
